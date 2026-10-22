@@ -1,0 +1,21 @@
+#!/bin/bash
+# Test double for systemctl.
+S="$STATE"
+echo "systemctl $*" >> "$S/calls"
+case "$1" in
+    is-enabled) [ -f "$S/enabled" ] ;;
+    is-active)  [ -f "$S/active" ] ;;
+    is-failed)  [ -f "$S/failed" ] ;;
+    restart)
+        if [ -f "$S/restartfail" ]
+        then
+            exit 1
+        fi
+        rm -f "$S/failed"
+        if [ ! -f "$S/staysdown" ]
+        then
+            touch "$S/active"
+        fi
+        exit 0
+        ;;
+esac

@@ -1,0 +1,140 @@
+#!/bin/bash
+# dpkg-caddy-cloudflare-hook
+#
+# Puts the Cloudflare DNS module back into Caddy after the caddy package replaced
+# /usr/bin/caddy with the stock binary - before Caddy is started again.
+#
+# Installed as /usr/local/sbin/dpkg-caddy-cloudflare-hook (mode 755) and called from
+# /etc/dpkg/dpkg.cfg.d/dpkg-caddy-cloudflare-hook after every dpkg run (post-invoke).
+#
+# Timing: apt runs "dpkg --unpack" and "dpkg --configure" as separate dpkg runs
+# (apt-pkg/deb/dpkgpm.cc: "Do all actions with the same Op in one run"), and Caddy's
+# postinst restarts the service only in the configure run (caddyserver/dist,
+# scripts/postinstall.sh: try-restart on upgrade). After the unpack run the stock binary
+# is on disk while the old Caddy process still runs; this hook adds the module there and
+# leaves the restart to the postinst. With a direct "dpkg -i" both steps are one run, the
+# package is already configured when the hook runs, and the hook restarts Caddy itself.
+#
+# It never exits non-zero: dpkg aborts when an invoke hook fails (run_invoke_hooks).
+# Problems are reported on stderr (visible in the apt output and /var/log/apt/term.log)
+# and in the journal (journalctl -t dpkg-caddy-cloudflare-hook); the next dpkg run tries
+# again.
+#
+# Behaviour of the caddy commands, read in the Caddy source (v2.11.7):
+# - "caddy list-modules" prints one module ID per line. With "--packages" a line is
+#   "<id> <package>", so an exact match on the package path never hits; the module ID
+#   is compared instead.
+# - "caddy add-package" fails with "package is already added" when the plugin is there.
+#   Otherwise it downloads the latest Caddy with all current plugins plus the new one
+#   from caddyserver.com and replaces the binary it runs from. The downloaded version can
+#   be newer than the one apt installed, and dpkg's checksum for /usr/bin/caddy no longer
+#   matches; both are accepted.
+
+set -u
+
+VERSION="1.0.0"
+TAG="dpkg-caddy-cloudflare-hook"
+PLUGIN_PACKAGE="github.com/caddy-dns/cloudflare"
+MODULE_ID="dns.providers.cloudflare"
+SERVICE="caddy"
+CADDY_BIN="${CADDY_BIN:-/usr/bin/caddy}"
+
+if [ "${1:-}" = "--version" ]
+then
+    printf '%s %s\n' "$TAG" "$VERSION"
+    exit 0
+fi
+
+say()
+{
+    printf '%s: %s\n' "$TAG" "$*" >&2
+    logger -t "$TAG" -p user.notice -- "$*" 2>/dev/null || true
+}
+
+fail()
+{
+    printf '%s: ERROR: %s\n' "$TAG" "$*" >&2
+    logger -t "$TAG" -p user.err -- "ERROR: $*" 2>/dev/null || true
+    exit 0
+}
+
+has_module()
+{
+    "$CADDY_BIN" list-modules 2>/dev/null \
+        | awk -v id="$MODULE_ID" '$1 == id { found = 1 } END { exit !found }'
+}
+
+service_in_use()
+{
+    systemctl is-enabled --quiet "$SERVICE" 2>/dev/null \
+        || systemctl is-active --quiet "$SERVICE" 2>/dev/null \
+        || systemctl is-failed --quiet "$SERVICE" 2>/dev/null
+}
+
+# Package state decides who restarts Caddy: "unpacked" or "half-configured" means its
+# postinst has not run yet and will restart it; "installed" means it already ran.
+# Anything else (not installed, config files only, broken) is none of our business.
+if ! status="$(dpkg-query -W -f='${Status}' caddy 2>/dev/null)"
+then
+    exit 0
+fi
+
+case "$status" in
+    *" ok installed")
+        configured=1
+        ;;
+    *" ok unpacked" | *" ok half-configured")
+        configured=0
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+
+if [ ! -x "$CADDY_BIN" ]
+then
+    exit 0
+fi
+
+# The common case after every dpkg run: the module is there, stay silent.
+if has_module
+then
+    exit 0
+fi
+
+say "$VERSION: module $MODULE_ID missing from $CADDY_BIN (package state: $status, dpkg action: ${DPKG_HOOK_ACTION:-unknown}), adding $PLUGIN_PACKAGE"
+
+if ! output="$("$CADDY_BIN" add-package "$PLUGIN_PACKAGE" 2>&1)"
+then
+    fail "caddy add-package failed: $(printf '%s\n' "$output" | tail -n 5)"
+fi
+
+if ! has_module
+then
+    fail "module $MODULE_ID still missing after caddy add-package"
+fi
+
+say "module added, binary is now: $("$CADDY_BIN" version 2>/dev/null | head -n 1)"
+
+if [ "$configured" -eq 0 ]
+then
+    say "caddy is not configured yet, its postinst will restart the service"
+    exit 0
+fi
+
+if service_in_use
+then
+    if ! systemctl restart "$SERVICE"
+    then
+        fail "systemctl restart $SERVICE failed, see: journalctl -u $SERVICE -n 50"
+    fi
+
+    if ! systemctl is-active --quiet "$SERVICE"
+    then
+        fail "$SERVICE is not active after the restart, see: journalctl -u $SERVICE -n 50"
+    fi
+
+    say "$SERVICE restarted"
+fi
+
+exit 0

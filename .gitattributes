@@ -1,0 +1,8 @@
+# Git never converts line endings - not on commit, not on checkout. Files are
+# stored and restored byte for byte, no matter how core.autocrlf is set on the
+# machine doing the work. Line endings are content, and keeping them correct is
+# the writing tool's job, not git's.
+#
+# -text switches off conversion only, not diffing: the diff attribute stays
+# unspecified, so git still detects binary files by itself.
+* -text

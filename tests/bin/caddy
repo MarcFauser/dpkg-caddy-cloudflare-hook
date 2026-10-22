@@ -1,0 +1,41 @@
+#!/bin/bash
+# Test double for caddy. State lives in files under $STATE.
+S="$STATE"
+case "$1" in
+    list-modules)
+        echo "http.handlers.file_server"
+        if [ -f "$S/module" ]
+        then
+            if [ "${2:-}" = "--packages" ]
+            then
+                echo "dns.providers.cloudflare github.com/caddy-dns/cloudflare"
+            else
+                cat "$S/module"
+            fi
+        fi
+        echo ""
+        echo "  Standard modules: 1"
+        ;;
+    add-package)
+        echo "add-package $2" >> "$S/calls"
+        if [ -f "$S/module" ]
+        then
+            echo "Error: package is already added" >&2
+            exit 1
+        fi
+        if [ -f "$S/netfail" ]
+        then
+            echo "Error: download failed: dial tcp: lookup caddyserver.com: no such host" >&2
+            exit 1
+        fi
+        if [ -f "$S/addbroken" ]
+        then
+            exit 0
+        fi
+        echo "dns.providers.cloudflare" > "$S/module"
+        echo "Module versions: (long list)"
+        ;;
+    version)
+        echo "v2.11.7 h1:test"
+        ;;
+esac

@@ -1,0 +1,27 @@
+#!/bin/sh
+# Every commit raises the version: CHANGELOG.md must be part of the commit, its newest
+# version must differ from the one in HEAD, and VERSION in the script must match it.
+
+script=usr/local/sbin/dpkg-caddy-cloudflare-hook
+staged=$(git diff --cached --name-only)
+
+abort()
+{
+    echo "" >&2
+    echo "  ABORT: $1" >&2
+    echo "  -> add a new version section to CHANGELOG.md and set VERSION in $script" >&2
+    echo "" >&2
+    exit 1
+}
+
+echo "$staged" | grep -q '^CHANGELOG\.md$' || abort "CHANGELOG.md is not part of this commit."
+
+new_version=$(git show :CHANGELOG.md | sed -n 's/^## \[\([0-9][0-9.]*\)\].*/\1/p' | head -n 1)
+script_version=$(git show ":$script" | sed -n 's/^VERSION="\([^"]*\)"$/\1/p')
+old_version=$(git show HEAD:CHANGELOG.md 2>/dev/null | sed -n 's/^## \[\([0-9][0-9.]*\)\].*/\1/p' | head -n 1)
+
+[ -n "$new_version" ] || abort "no version section found in CHANGELOG.md."
+[ "$new_version" = "$script_version" ] || abort "VERSION in the script is '$script_version', CHANGELOG.md says '$new_version'."
+[ "$new_version" != "$old_version" ] || abort "version $new_version is already in HEAD; every commit needs a new one."
+
+exit 0

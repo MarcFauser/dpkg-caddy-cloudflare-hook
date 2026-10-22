@@ -1,0 +1,13 @@
+#!/bin/bash
+# Test double for dpkg-query -W -f='${Status}' caddy. Status comes from $STATE/status.
+if [ -f "$STATE/notinstalled" ]
+then
+    echo "dpkg-query: no packages found matching caddy" >&2
+    exit 1
+fi
+if [ -f "$STATE/status" ]
+then
+    printf '%s' "$(cat "$STATE/status")"
+else
+    printf 'install ok installed'
+fi
