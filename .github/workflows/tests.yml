@@ -1,0 +1,32 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Weekly, so that a change in Caddy's packaging or in apt/dpkg shows up without a push.
+    - cron: '17 4 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: unit tests (test doubles)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: bash tests/run-tests.sh
+
+  e2e:
+    name: real caddy package on ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['debian:12', 'debian:13', 'ubuntu:24.04']
+    steps:
+      - uses: actions/checkout@v7
+      - run: bash tests/e2e.sh

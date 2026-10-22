@@ -1,5 +1,7 @@
 # dpkg-caddy-cloudflare-hook
 
+[![tests](https://github.com/MarcFauser/dpkg-caddy-cloudflare-hook/actions/workflows/tests.yml/badge.svg)](https://github.com/MarcFauser/dpkg-caddy-cloudflare-hook/actions/workflows/tests.yml)
+
 A dpkg hook for Debian and Ubuntu that puts the Cloudflare DNS module back into
 [Caddy](https://caddyserver.com) whenever the `caddy` package is upgraded, **before Caddy is
 started again**.
@@ -91,12 +93,29 @@ the download from `caddyserver.com` takes.
 bash tests/run-tests.sh
 ```
 
-The tests run the unchanged hook against small test doubles for `caddy`, `systemctl`,
+The unit tests run the unchanged hook against small test doubles for `caddy`, `systemctl`,
 `dpkg-query` and `logger`, covering the unpack and the `dpkg -i` paths, the package states,
 download and restart failures and the line in `dpkg.cfg.d` itself. They need only bash and
 the usual text tools, so they also run under Git for Windows.
 
-**Status:** tested with the test doubles; not yet run on a real system.
+`tests/e2e.sh` is the end-to-end test for a throwaway Debian or Ubuntu container (it
+reinstalls caddy, so not for a server that matters). It installs Caddy from Caddy's apt
+repository, adds the module by hand, installs the hook, and checks that an `apt` reinstall
+gets the module back in the unpack run, that `dpkg -i` gets it back too, that an unrelated
+dpkg run stays silent, and that `--uninstall` removes both files. Containers have no systemd,
+so the service restart itself is not covered.
+
+GitHub Actions (`.github/workflows/tests.yml`) runs the unit tests and the end-to-end test in
+Debian 12, Debian 13 and Ubuntu 24.04 on every push, weekly and on demand. Not yet run on a
+server with systemd.
+
+## Development
+
+On the machine you commit from, activate the version guard once after cloning:
+double-click `install-git-hooks.cmd` on Windows, or run `pwsh ./install-git-hooks.ps1`. It
+copies `_git_hooks/pre-commit` into `.git/hooks`, which git does not version. The hook refuses
+a commit without a new version section in `CHANGELOG.md` and a matching `VERSION` in the
+script. Neither file is needed on the servers.
 
 ## License
 
