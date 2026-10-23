@@ -56,6 +56,13 @@ case "$1" in
             echo "Error: download failed: dial tcp: lookup caddyserver.com: no such host" >&2
             exit 1
         fi
+        if [ -f "$S/failonce" ]
+        then
+            # only the first attempt fails
+            rm -f "$S/failonce"
+            echo "Error: download failed: connection reset by peer" >&2
+            exit 1
+        fi
         if [ -f "$S/addbroken" ]
         then
             exit 0

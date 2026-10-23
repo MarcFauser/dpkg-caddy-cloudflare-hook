@@ -1,0 +1,14 @@
+# Part of dpkg-caddy-cloudflare-hook: retries every 5 minutes while a fallback is active.
+# Installed disabled; the hook runs "systemctl enable --now" on a fallback and
+# "systemctl disable --now" once the module is back. A run that is still going when the
+# timer elapses is left running, not started twice (systemd.timer(5)).
+[Unit]
+Description=Retry adding the Cloudflare DNS module to Caddy every 5 minutes (dpkg-caddy-cloudflare-hook)
+Documentation=https://github.com/MarcFauser/dpkg-caddy-cloudflare-hook
+
+[Timer]
+OnActiveSec=5min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target

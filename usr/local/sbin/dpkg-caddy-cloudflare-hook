@@ -8,8 +8,9 @@
 #
 # Installed as /usr/local/sbin/dpkg-caddy-cloudflare-hook (mode 755) and called from
 # /etc/dpkg/dpkg.cfg.d/dpkg-caddy-cloudflare-hook before (--pre-invoke) and after
-# (--post-invoke, also the default without an option) every dpkg run. Its state lives in
-# /var/lib/dpkg-caddy-cloudflare-hook.
+# (--post-invoke, also the default without an option) every dpkg run, and with --retry
+# from dpkg-caddy-cloudflare-hook-retry.timer while a fallback is active. Its state lives
+# in /var/lib/dpkg-caddy-cloudflare-hook.
 #
 # Timing: apt runs "dpkg --unpack" and "dpkg --configure" as separate dpkg runs
 # (apt-pkg/deb/dpkgpm.cc: "Do all actions with the same Op in one run"), and Caddy's
@@ -22,11 +23,13 @@
 # The fallback: dpkg runs pre-invoke hooks before the action and post-invoke hooks after
 # it (src/main/main.c, run_invoke_hooks around cipaction->action). Before a run that
 # unpacks or installs, the pre-invoke step saves /usr/bin/caddy as caddy.previous if it
-# has the module. When the post-invoke step cannot add the module, it keeps the stock
-# binary as caddy.stock, puts caddy.previous back and writes the marker "pending". dpkg
-# still counts the new package version as installed, so apt will not offer it again; the
-# hook retries by itself on a later dpkg run (at most once per RETRY_INTERVAL minutes, any
-# time when run by hand) by adding the module to caddy.stock.
+# has the module. When the post-invoke step cannot add the module in ADD_PACKAGE_ATTEMPTS
+# attempts, it keeps the stock binary as caddy.stock, puts caddy.previous back, writes the
+# marker "pending" and enables the retry timer. dpkg still counts the new package version
+# as installed, so apt will not offer it again; the timer runs this script with --retry
+# every 5 minutes, which adds the module to caddy.stock, puts the result in place,
+# restarts Caddy and disables the timer again. /etc/update-motd.d/90-dpkg-caddy-cloudflare-hook
+# shows the marker at login.
 #
 # It never exits non-zero: dpkg aborts when an invoke hook fails (run_invoke_hooks).
 # Problems are reported on stderr (visible in the apt output and /var/log/apt/term.log)
@@ -47,24 +50,30 @@
 #   retry adds the module to the stock binary again instead.
 # - The download is a plain http.Get without any timeout (line 298), and Caddy's build
 #   server comes without an SLA (caddyserver/caddy#7010). It did not answer for hours on
-#   2026-10-23, so the call is limited here; otherwise it would hold the whole dpkg run.
+#   2026-10-23, so every call is limited here; otherwise it would hold the whole dpkg run.
+#   With a working build server it took 0.7 to 1.7 s in CI; the retries outside dpkg get
+#   more time in case a first build after a new Caddy release takes longer.
 
 set -u
 
-VERSION="1.1.1"
+VERSION="1.2.0"
 TAG="dpkg-caddy-cloudflare-hook"
 PLUGIN_PACKAGE="github.com/caddy-dns/cloudflare"
 MODULE_ID="dns.providers.cloudflare"
 SERVICE="caddy"
+TIMER="dpkg-caddy-cloudflare-hook-retry.timer"
 CADDY_BIN="${CADDY_BIN:-/usr/bin/caddy}"
 STATE_DIR="${HOOK_STATE_DIR:-/var/lib/dpkg-caddy-cloudflare-hook}"
-ADD_PACKAGE_TIMEOUT="${ADD_PACKAGE_TIMEOUT:-300}"
-RETRY_INTERVAL="${RETRY_INTERVAL:-60}"
+ADD_PACKAGE_TIMEOUT="${ADD_PACKAGE_TIMEOUT:-30}"     # per attempt during a dpkg run
+ADD_PACKAGE_ATTEMPTS="${ADD_PACKAGE_ATTEMPTS:-3}"    # attempts during a dpkg run
+ATTEMPT_PAUSE="${ATTEMPT_PAUSE:-5}"                  # seconds between those attempts
+RETRY_TIMEOUT="${RETRY_TIMEOUT:-300}"                # per attempt from the timer or by hand
 
 PREVIOUS="$STATE_DIR/caddy.previous"   # last binary with the module, saved before dpkg replaced it
 STOCK="$STATE_DIR/caddy.stock"         # the package's binary while the previous one runs instead
 PENDING="$STATE_DIR/pending"           # present while the previous binary runs instead
 WORK="$STATE_DIR/work"                 # caddy add-package runs here, on a copy
+LOCK="$STATE_DIR/lock"                 # keeps a timer run and a dpkg run apart
 
 case "${1:-}" in
     --version)
@@ -77,15 +86,29 @@ case "${1:-}" in
     --post-invoke | "")
         mode="post"
         ;;
+    --retry)
+        mode="retry"
+        ;;
     *)
-        printf '%s: unknown option %s (expected --pre-invoke, --post-invoke or --version)\n' "$TAG" "$1" >&2
+        printf '%s: unknown option %s (expected --pre-invoke, --post-invoke, --retry or --version)\n' "$TAG" "$1" >&2
         exit 2
         ;;
 esac
 
+# Run from the timer, the journal gets the messages through logger only; the service's
+# own stderr would put every line there a second time.
+to_stderr=1
+if [ "$mode" = "retry" ] && [ ! -t 2 ]
+then
+    to_stderr=0
+fi
+
 say()
 {
-    printf '%s: %s\n' "$TAG" "$*" >&2
+    if [ "$to_stderr" -eq 1 ]
+    then
+        printf '%s: %s\n' "$TAG" "$*" >&2
+    fi
     logger -t "$TAG" -p user.notice -- "$*" 2>/dev/null || true
 }
 
@@ -96,7 +119,10 @@ note()
 
 warn()
 {
-    printf '%s: ERROR: %s\n' "$TAG" "$*" >&2
+    if [ "$to_stderr" -eq 1 ]
+    then
+        printf '%s: ERROR: %s\n' "$TAG" "$*" >&2
+    fi
     logger -t "$TAG" -p user.err -- "ERROR: $*" 2>/dev/null || true
 }
 
@@ -150,16 +176,38 @@ write_pending()
     return 1
 }
 
-clear_pending()
+start_retries()
 {
-    rm -f -- "$PENDING" "$STOCK"
+    if systemctl enable --now "$TIMER" >/dev/null 2>&1
+    then
+        return 0
+    fi
+
+    warn "could not enable $TIMER (no systemd?), so there are no automatic retries; run $TAG --retry by hand"
+    return 1
 }
 
-# Runs caddy add-package on a copy of $1. On success the result is $WORK/caddy and has the
-# module; otherwise $reason says why. The caller removes $WORK.
+stop_retries()
+{
+    systemctl disable --now "$TIMER" >/dev/null 2>&1 || true
+}
+
+# Ends a fallback: the marker goes (and with it the login notice), the timer stops.
+clear_pending()
+{
+    if [ -f "$PENDING" ]
+    then
+        rm -f -- "$PENDING"
+        stop_retries
+    fi
+    rm -f -- "$STOCK"
+}
+
+# Runs caddy add-package on a copy of $1, limited to $2 seconds. On success the result is
+# $WORK/caddy and has the module; otherwise $reason says why. The caller removes $WORK.
 build_with_module()
 {
-    local src="$1" output rc
+    local src="$1" limit="$2" output rc
 
     rm -rf -- "$WORK"
     if ! mkdir -p -- "$WORK" || ! cp --preserve=mode,ownership -- "$src" "$WORK/caddy"
@@ -168,12 +216,12 @@ build_with_module()
         return 1
     fi
 
-    output="$(timeout --kill-after=10 "$ADD_PACKAGE_TIMEOUT" "$WORK/caddy" add-package "$PLUGIN_PACKAGE" 2>&1)"
+    output="$(timeout --kill-after=10 "$limit" "$WORK/caddy" add-package "$PLUGIN_PACKAGE" 2>&1)"
     rc=$?
 
     if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]
     then
-        reason="caddy add-package did not finish within $ADD_PACKAGE_TIMEOUT s (is caddyserver.com answering?)"
+        reason="caddy add-package did not finish within $limit s (is caddyserver.com answering?)"
         return 1
     fi
 
@@ -269,54 +317,82 @@ fall_back()
     fi
 
     previous_version="$(binary_version "$CADDY_BIN")"
-    write_pending "caddy package $package_version is installed, the previous binary $previous_version runs instead"
-    warn "$why; put the previous binary ($previous_version, with the module) back, so caddy $package_version from the package does not run yet. dpkg counts $package_version as installed and apt will not offer it again; this hook tries again at a dpkg run in $RETRY_INTERVAL minutes or later, or run $TAG by hand"
+    write_pending "caddy package $package_version is installed, but the previous binary $previous_version runs because the Cloudflare module could not be added"
+    warn "$why; put the previous binary ($previous_version, with the module) back, so caddy $package_version from the package does not run yet. dpkg counts $package_version as installed and apt will not offer it again; $TIMER tries again every 5 minutes, or run $TAG --retry"
+    start_retries
     restart_after_change
 }
 
-# The previous binary runs instead of the package's: try to add the module again.
-retry_pending()
+# During a fallback: is the previous binary still the one in place, and is the stock binary
+# there to retry with? Ends the fallback or the retries when not.
+fallback_intact()
 {
     if [ ! -f "$PREVIOUS" ] || ! cmp -s -- "$CADDY_BIN" "$PREVIOUS"
     then
         say "$CADDY_BIN changed since the fallback (replaced by hand?), no more retries"
         clear_pending
-        return 0
+        return 1
     fi
 
     if [ ! -f "$STOCK" ]
     then
-        warn "the stock binary $STOCK is gone, so there is nothing to retry with; run: apt install --reinstall caddy"
-        clear_pending
-        return 0
+        warn "the kept stock binary $STOCK is gone, so there is nothing to retry with; run: apt install --reinstall caddy"
+        stop_retries
+        return 1
     fi
 
-    # Run by dpkg, at most once per RETRY_INTERVAL minutes: a build server that does not
-    # answer would otherwise hold every dpkg run for ADD_PACKAGE_TIMEOUT. By hand, always.
-    if [ -n "${DPKG_HOOK_ACTION:-}" ] && [ -n "$(find "$PENDING" -mmin "-$RETRY_INTERVAL" 2>/dev/null)" ]
+    return 0
+}
+
+# The previous binary runs instead of the package's: add the module to the stock binary.
+retry_pending()
+{
+    if ! fallback_intact
     then
-        say "still waiting: $(cat -- "$PENDING" 2>/dev/null); next try at a dpkg run $RETRY_INTERVAL minutes after the last one, or run $TAG by hand"
         return 0
     fi
 
     say "$VERSION: $(cat -- "$PENDING" 2>/dev/null); adding $PLUGIN_PACKAGE to the stock binary again"
 
-    if ! build_with_module "$STOCK"
+    if ! build_with_module "$STOCK" "$RETRY_TIMEOUT"
     then
         rm -rf -- "$WORK"
-        touch -- "$PENDING"
-        warn "$reason; the previous binary keeps running"
+        warn "$reason; the previous binary keeps running, $TIMER tries again in 5 minutes"
         return 0
     fi
 
     install_built
 }
 
+# Waits for a running timer retry (dpkg runs) or gives way to a dpkg run (timer). Without
+# flock (util-linux) the runs are not kept apart; dpkg's own replacing of the binary is
+# not covered either way, but every state it can leave is one the next run handles.
+take_lock()
+{
+    if ! command -v flock >/dev/null 2>&1 || ! exec 9> "$LOCK"
+    then
+        return 0
+    fi
+
+    if [ "$mode" = "retry" ]
+    then
+        flock -n 9 || exit 0
+    elif ! flock -w 600 9
+    then
+        warn "waited 600 s for $LOCK, going on without it"
+    fi
+}
+
 # Package state decides who restarts Caddy: "unpacked" or "half-configured" means its
 # postinst has not run yet and will restart it; "installed" means it already ran.
-# Anything else (not installed, config files only, broken) is none of our business.
+# Anything else (not installed, config files only, broken) is none of our business; a
+# fallback left over from before the package was removed ends with it.
 if ! status="$(dpkg-query -W -f='${Status}' caddy 2>/dev/null)"
 then
+    if [ "$mode" = "retry" ]
+    then
+        clear_pending
+    fi
     exit 0
 fi
 
@@ -328,12 +404,43 @@ case "$status" in
         configured=0
         ;;
     *)
+        if [ "$mode" = "retry" ]
+        then
+            clear_pending
+        fi
         exit 0
         ;;
 esac
 
 if [ ! -x "$CADDY_BIN" ]
 then
+    exit 0
+fi
+
+if ! mkdir -p -- "$STATE_DIR"
+then
+    fail "could not create $STATE_DIR"
+fi
+
+take_lock
+
+if [ "$mode" = "retry" ]
+then
+    # Nothing to do (anymore): switch the timer off.
+    if [ ! -f "$PENDING" ]
+    then
+        stop_retries
+        exit 0
+    fi
+
+    # In the middle of a dpkg run, or the stock binary is back in place: that is for the
+    # dpkg hook, the timer tries again later.
+    if [ "$configured" -eq 0 ] || ! has_module
+    then
+        exit 0
+    fi
+
+    retry_pending
     exit 0
 fi
 
@@ -377,7 +484,16 @@ if has_module
 then
     if [ -f "$PENDING" ]
     then
-        retry_pending
+        if [ -z "${DPKG_HOOK_ACTION:-}" ]
+        then
+            # run by hand: retry now
+            retry_pending
+        elif fallback_intact
+        then
+            # run by dpkg: the timer retries, dpkg is not held up
+            say "still waiting: $(cat -- "$PENDING" 2>/dev/null); $TIMER tries again every 5 minutes, or run $TAG --retry"
+            start_retries
+        fi
     fi
 
     exit 0
@@ -385,17 +501,27 @@ fi
 
 say "$VERSION: module $MODULE_ID missing from $CADDY_BIN (package state: $status, dpkg action: ${DPKG_HOOK_ACTION:-unknown}), adding $PLUGIN_PACKAGE"
 
-if ! mkdir -p -- "$STATE_DIR"
-then
-    fail "could not create $STATE_DIR"
-fi
+attempt=1
+while :
+do
+    if build_with_module "$CADDY_BIN" "$ADD_PACKAGE_TIMEOUT"
+    then
+        install_built
+        exit 0
+    fi
 
-if build_with_module "$CADDY_BIN"
-then
-    install_built
-    exit 0
-fi
+    rm -rf -- "$WORK"
+    note "attempt $attempt of $ADD_PACKAGE_ATTEMPTS failed: $reason"
 
-rm -rf -- "$WORK"
-fall_back "$reason"
+    if [ "$attempt" -ge "$ADD_PACKAGE_ATTEMPTS" ]
+    then
+        break
+    fi
+
+    say "attempt $attempt of $ADD_PACKAGE_ATTEMPTS failed, trying again in $ATTEMPT_PAUSE s"
+    sleep "$ATTEMPT_PAUSE"
+    attempt=$((attempt + 1))
+done
+
+fall_back "$reason (attempt $attempt of $ADD_PACKAGE_ATTEMPTS)"
 exit 0

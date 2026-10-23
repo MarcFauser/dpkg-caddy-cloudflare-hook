@@ -5,6 +5,9 @@ set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 HOOK="${HOOK:-$HERE/../usr/local/sbin/dpkg-caddy-cloudflare-hook}"
 CONF="$HERE/../etc/dpkg/dpkg.cfg.d/dpkg-caddy-cloudflare-hook"
+UNITS="$HERE/../etc/systemd/system"
+MOTD="$HERE/../etc/update-motd.d/90-dpkg-caddy-cloudflare-hook"
+TIMER_CALL="dpkg-caddy-cloudflare-hook-retry.timer"
 BIN="$HERE/bin"
 passed=0
 failed=0
@@ -52,13 +55,15 @@ mkpending()
     mkbin "$CB" dns.providers.cloudflare v2.11.6
     cp "$CB" "$SD/caddy.previous"
     cp "$BIN/caddy" "$SD/caddy.stock"
-    echo "caddy package 2.11.7 is installed, the previous binary v2.11.6 runs instead" > "$SD/pending"
+    echo "caddy package 2.11.7 is installed, but the previous binary v2.11.6 runs because the Cloudflare module could not be added" > "$SD/pending"
+    touch "$STATE/timer-enabled"
 }
 
 # Runs the hook with the options given; ACT sets DPKG_HOOK_ACTION, unset means "by hand".
+# The pause between attempts is 0 unless a test sets TEST_PAUSE.
 run_hook()
 {
-    local envs=(CADDY_BIN="$CB" HOOK_STATE_DIR="$SD" ADD_PACKAGE_TIMEOUT="${TEST_TIMEOUT:-300}" RETRY_INTERVAL="${TEST_RETRY:-60}" PATH="$BIN:$PATH")
+    local envs=(CADDY_BIN="$CB" HOOK_STATE_DIR="$SD" ADD_PACKAGE_TIMEOUT="${TEST_TIMEOUT:-30}" ADD_PACKAGE_ATTEMPTS="${TEST_ATTEMPTS:-3}" ATTEMPT_PAUSE="${TEST_PAUSE:-0}" RETRY_TIMEOUT="${TEST_RETRY_TIMEOUT:-300}" PATH="$BIN:$PATH")
     if [ -n "${ACT:-}" ]
     then
         envs+=(DPKG_HOOK_ACTION="$ACT")
@@ -194,7 +199,9 @@ echo "18 add-package hangs (build server not answering)"
 setup enabled hang; TEST_TIMEOUT=2; started=$SECONDS; run_hook; took=$((SECONDS - started)); unset TEST_TIMEOUT
 check "exit 0" '[ "$RC" -eq 0 ]'
 check "reports the time limit" 'grep -q "did not finish within 2 s" <<< "$ERR"'
-check "returns within the limit (took ${took}s)" '[ "$took" -lt 20 ]'
+# three attempts: about 6 s with the limit, 90 s without (the double sleeps 30 s); the
+# margin is wide because a loaded machine stretched 6 s to 23 s
+check "returns within the limit (took ${took}s)" '[ "$took" -lt 45 ]'
 check "no restart" '! grep -q "systemctl restart" <<< "$CALLS"'
 
 echo "19 killed after caddy parked its copy as .tmp, nothing saved to fall back to"
@@ -254,7 +261,10 @@ check "reports the fallback" 'grep -q "put the previous binary (v2.11.6, with th
 check "says apt will not offer it again" 'grep -q "apt will not offer it again" <<< "$ERR"'
 check "binary is the previous one" 'cmp -s "$SD/caddy.previous" "$CB"'
 check "stock binary kept" 'cmp -s "$BIN/caddy" "$SD/caddy.stock"'
-check "marker names both versions" 'grep -q "caddy package 2.11.7 is installed, the previous binary v2.11.6" "$SD/pending"'
+check "marker names both versions" 'grep -q "caddy package 2.11.7 is installed, but the previous binary v2.11.6 runs" "$SD/pending"'
+check "three attempts before falling back" '[ "$(grep -c "^add-package " <<< "$CALLS")" -eq 3 ]'
+check "says which attempt failed last" 'grep -q "(attempt 3 of 3)" <<< "$ERR"'
+check "retry timer enabled" 'grep -q "systemctl enable --now $TIMER_CALL" <<< "$CALLS" && [ -f "$STATE/timer-enabled" ]'
 check "work directory removed" '[ ! -e "$SD/work" ]'
 check "NO restart, the postinst does it" '! grep -q "systemctl restart" <<< "$CALLS"'
 check "says the postinst will restart" 'grep -q "postinst will restart" <<< "$ERR"'
@@ -269,7 +279,7 @@ echo "30 add-package hangs: falls back within the limit"
 setup enabled hang; mkbin "$SD/caddy.previous" dns.providers.cloudflare v2.11.6; TEST_TIMEOUT=2; started=$SECONDS; ACT=unpack run_hook; took=$((SECONDS - started)); unset TEST_TIMEOUT
 check "reports the time limit" 'grep -q "did not finish within 2 s" <<< "$ERR"'
 check "binary is the previous one" 'cmp -s "$SD/caddy.previous" "$CB"'
-check "returns within the limit (took ${took}s)" '[ "$took" -lt 20 ]'
+check "returns within the limit (took ${took}s, 90 s without it)" '[ "$took" -lt 45 ]'
 
 echo "31 add-package claims success without the module: falls back"
 setup enabled addbroken; mkbin "$SD/caddy.previous" dns.providers.cloudflare v2.11.6; ACT=unpack run_hook
@@ -282,54 +292,151 @@ check "says there is nothing to fall back to" 'grep -q "no saved binary with the
 check "binary untouched" 'cmp -s "$BIN/caddy" "$CB"'
 check "no marker" '[ ! -e "$SD/pending" ]'
 
-echo "33 fallback active, dpkg run within the interval: no retry yet"
-setup enabled active; mkpending; ACT=configure run_hook
+echo "33 fallback active, a dpkg run: no retry there, the timer does it"
+setup enabled active; mkpending; rm "$STATE/timer-enabled"; ACT=configure run_hook
 check "exit 0" '[ "$RC" -eq 0 ]'
 check "no add-package" '! grep -q add-package <<< "$CALLS"'
 check "says it is still waiting" 'grep -q "still waiting: caddy package 2.11.7" <<< "$ERR"'
+check "makes sure the timer is on" 'grep -q "systemctl enable --now $TIMER_CALL" <<< "$CALLS" && [ -f "$STATE/timer-enabled" ]'
 check "marker kept" '[ -f "$SD/pending" ]'
 check "binary untouched" 'cmp -s "$SD/caddy.previous" "$CB"'
 
-echo "34 fallback active, interval over: the retry adds the module to the stock binary"
-setup enabled active; mkpending; TEST_RETRY=0; ACT=configure run_hook; unset TEST_RETRY
+echo "34 timer run: the retry adds the module to the stock binary"
+setup enabled active; mkpending; run_hook --retry
 check "add-package ran on a copy of the stock binary" 'grep -q "add-package github.com/caddy-dns/cloudflare on $SD/work/caddy" <<< "$CALLS"'
 check "binary is the new build with the module" '[ "$(version_of "$CB")" = v2.11.8 ] && "$CB" list-modules | grep -qx dns.providers.cloudflare'
 check "marker removed" '[ ! -e "$SD/pending" ]'
 check "stock copy removed" '[ ! -e "$SD/caddy.stock" ]'
 check "restart called" 'grep -q "systemctl restart caddy" <<< "$CALLS"'
-check "no ERROR" '! grep -q ERROR <<< "$ERR"'
+check "timer switched off" 'grep -q "systemctl disable --now $TIMER_CALL" <<< "$CALLS" && [ ! -f "$STATE/timer-enabled" ]'
+check "silent on stderr, not a terminal" '[ -z "$ERR" ]'
+check "result in the journal" 'grep -q "logger -t dpkg-caddy-cloudflare-hook -p user.notice -- module added" <<< "$CALLS"'
+check "announces the retry in the journal" 'grep -q "adding github.com/caddy-dns/cloudflare to the stock binary again" <<< "$CALLS"'
 
 echo "35 fallback active, run by hand: retries at once"
 setup; mkpending; run_hook
 check "add-package called" 'grep -q add-package <<< "$CALLS"'
 check "marker removed" '[ ! -e "$SD/pending" ]'
+check "timer switched off" '[ ! -f "$STATE/timer-enabled" ]'
 
-echo "36 retry fails: the previous binary keeps running, the next try waits again"
-setup enabled active netfail; mkpending; touch -d "2 hours ago" "$SD/pending"; ACT=configure run_hook
-check "reports the cause" 'grep -q "ERROR: caddy add-package failed" <<< "$ERR"'
-check "says the previous binary keeps running" 'grep -q "previous binary keeps running" <<< "$ERR"'
+echo "36 timer run fails: the previous binary keeps running, the timer stays on"
+setup enabled active netfail; mkpending; run_hook --retry
+check "reports the cause in the journal" 'grep -q "user.err -- ERROR: caddy add-package failed" <<< "$CALLS"'
+check "says the timer tries again" 'grep -q "previous binary keeps running, $TIMER_CALL tries again in 5 minutes" <<< "$CALLS"'
+check "one attempt per timer run" '[ "$(grep -c "^add-package " <<< "$CALLS")" -eq 1 ]'
 check "binary untouched" 'cmp -s "$SD/caddy.previous" "$CB"'
-check "marker kept and touched" '[ -n "$(find "$SD/pending" -mmin -5)" ]'
+check "marker kept" '[ -f "$SD/pending" ]'
 check "stock copy kept" '[ -f "$SD/caddy.stock" ]'
+check "timer stays on" '! grep -q "systemctl disable" <<< "$CALLS" && [ -f "$STATE/timer-enabled" ]'
 check "no restart" '! grep -q "systemctl restart" <<< "$CALLS"'
 
 echo "37 binary replaced by hand during a fallback: retries stop"
-setup; mkpending; mkbin "$CB" dns.providers.cloudflare v2.11.9; run_hook
-check "says it changed" 'grep -q "changed since the fallback" <<< "$ERR"'
+setup; mkpending; mkbin "$CB" dns.providers.cloudflare v2.11.9; run_hook --retry
+check "says it changed" 'grep -q "changed since the fallback" <<< "$CALLS"'
 check "no add-package" '! grep -q add-package <<< "$CALLS"'
 check "marker removed" '[ ! -e "$SD/pending" ]'
+check "timer switched off" '[ ! -f "$STATE/timer-enabled" ]'
 check "binary untouched" '[ "$(version_of "$CB")" = v2.11.9 ]'
 
-echo "38 stock copy gone: retries stop with a hint"
-setup; mkpending; rm "$SD/caddy.stock"; run_hook
-check "points to a reinstall" 'grep -q "apt install --reinstall caddy" <<< "$ERR"'
-check "marker removed" '[ ! -e "$SD/pending" ]'
+echo "38 stock copy gone: retries stop, the notice stays"
+setup; mkpending; rm "$SD/caddy.stock"; run_hook --retry
+check "points to a reinstall" 'grep -q "apt install --reinstall caddy" <<< "$CALLS"'
+check "marker kept, so the login notice stays" '[ -f "$SD/pending" ]'
+check "timer switched off" '[ ! -f "$STATE/timer-enabled" ]'
+check "no add-package" '! grep -q add-package <<< "$CALLS"'
 
 echo "39 a new package arrives during a fallback and the module can be added: fallback over"
 setup "status=install ok unpacked"; mkpending; mkbin "$CB"; ACT=unpack run_hook
 check "binary has the module" '"$CB" list-modules | grep -qx dns.providers.cloudflare'
 check "marker removed" '[ ! -e "$SD/pending" ]'
 check "old stock copy removed" '[ ! -e "$SD/caddy.stock" ]'
+check "timer switched off" '[ ! -f "$STATE/timer-enabled" ]'
+
+echo "41 three attempts in a dpkg run, each noted in the journal"
+setup enabled netfail; ACT=unpack run_hook
+check "three add-package calls" '[ "$(grep -c "^add-package " <<< "$CALLS")" -eq 3 ]'
+check "attempts 1 and 2 announced" 'grep -q "attempt 1 of 3 failed, trying again" <<< "$ERR" && grep -q "attempt 2 of 3 failed, trying again" <<< "$ERR"'
+check "every reason in the journal" '[ "$(grep -c "attempt [123] of 3 failed: caddy add-package failed" <<< "$CALLS")" -eq 3 ]'
+
+echo "42 the second attempt works: no fallback"
+setup enabled active failonce; mkbin "$SD/caddy.previous" dns.providers.cloudflare v2.11.6; ACT=unpack run_hook
+check "two add-package calls" '[ "$(grep -c "^add-package " <<< "$CALLS")" -eq 2 ]'
+check "binary has the module" '"$CB" list-modules | grep -qx dns.providers.cloudflare && [ "$(version_of "$CB")" = v2.11.8 ]'
+check "no marker" '[ ! -e "$SD/pending" ]'
+check "no timer" '! grep -q "systemctl enable" <<< "$CALLS"'
+check "no ERROR" '! grep -q ERROR <<< "$ERR"'
+
+echo "43 pause between attempts"
+setup netfail; TEST_PAUSE=1; started=$SECONDS; ACT=unpack run_hook; took=$((SECONDS - started)); unset TEST_PAUSE
+check "two pauses of 1 s (took ${took}s)" '[ "$took" -ge 2 ]'
+check "announces the pause" 'grep -q "trying again in 1 s" <<< "$ERR"'
+
+echo "44 fallback without systemd: says there are no automatic retries"
+setup netfail timerfail; mkbin "$SD/caddy.previous" dns.providers.cloudflare v2.11.6; ACT=unpack run_hook
+check "binary is the previous one" 'cmp -s "$SD/caddy.previous" "$CB"'
+check "says there are no automatic retries" 'grep -q "no automatic retries; run dpkg-caddy-cloudflare-hook --retry by hand" <<< "$ERR"'
+check "marker written anyway" '[ -f "$SD/pending" ]'
+
+echo "45 timer run without a fallback: switches the timer off"
+setup; mkdir -p "$SD"; touch "$STATE/timer-enabled"; run_hook --retry
+check "no add-package" '! grep -q add-package <<< "$CALLS"'
+check "timer switched off" '[ ! -f "$STATE/timer-enabled" ]'
+check "silent" '[ -z "$ERR" ]'
+
+echo "46 timer run while a dpkg run holds the lock: skipped"
+setup lockbusy; mkpending; run_hook --retry
+check "asked without waiting" 'grep -q "^flock -n 9" <<< "$CALLS"'
+check "no add-package" '! grep -q add-package <<< "$CALLS"'
+check "marker kept" '[ -f "$SD/pending" ]'
+
+echo "47 dpkg runs wait for the lock"
+setup; mkbin "$CB" dns.providers.cloudflare v2.11.6; ACT=unpack run_hook --pre-invoke
+check "waits up to 600 s" 'grep -q "^flock -w 600 9" <<< "$CALLS"'
+
+echo "48 timer run in the middle of a dpkg run: skipped"
+setup "status=install ok unpacked"; mkpending; run_hook --retry
+check "no add-package" '! grep -q add-package <<< "$CALLS"'
+check "marker kept" '[ -f "$SD/pending" ]'
+
+echo "49 timer run with the stock binary back in place: left to the dpkg hook"
+setup; mkpending; mkbin "$CB"; run_hook --retry
+check "no add-package" '! grep -q add-package <<< "$CALLS"'
+check "marker kept" '[ -f "$SD/pending" ]'
+
+echo "50 timer run after the caddy package was removed: fallback over"
+setup "status=deinstall ok config-files"; mkpending; run_hook --retry
+check "marker removed" '[ ! -e "$SD/pending" ]'
+check "timer switched off" '[ ! -f "$STATE/timer-enabled" ]'
+
+echo "51 timer run that hangs: limited by RETRY_TIMEOUT"
+setup hang; mkpending; TEST_RETRY_TIMEOUT=2; started=$SECONDS; run_hook --retry; took=$((SECONDS - started)); unset TEST_RETRY_TIMEOUT
+check "reports the retry limit" 'grep -q "did not finish within 2 s" <<< "$CALLS"'
+check "returns within the limit (took ${took}s)" '[ "$took" -lt 20 ]'
+check "binary untouched" 'cmp -s "$SD/caddy.previous" "$CB"'
+
+echo "52 login notice"
+setup
+OUT="$(HOOK_STATE_DIR="$SD" sh "$MOTD")"; ERR="$OUT"; CALLS=""
+check "nothing without a fallback" '[ -z "$OUT" ]'
+mkpending
+OUT="$(HOOK_STATE_DIR="$SD" sh "$MOTD")"; RC=$?; ERR="$OUT"
+check "shows the marker" 'grep -q "dpkg-caddy-cloudflare-hook: caddy package 2.11.7 is installed, but the previous binary v2.11.6 runs" <<< "$OUT"'
+check "names the retries and the journal" 'grep -q "Retried every 5 minutes. Details: journalctl -t dpkg-caddy-cloudflare-hook" <<< "$OUT"'
+check "exit 0" '[ "$RC" -eq 0 ]'
+rm "$SD/caddy.stock"
+OUT="$(HOOK_STATE_DIR="$SD" sh "$MOTD")"; ERR="$OUT"
+check "without the stock copy: points to a reinstall" 'grep -q "No automatic retry possible; run: apt install --reinstall caddy" <<< "$OUT"'
+check "file name valid for run-parts --lsbsysinit" '[[ "$(basename "$MOTD")" =~ ^[A-Za-z0-9_-]+$ ]]'
+check "parses" 'sh -n "$MOTD"'
+
+echo "53 the systemd units"
+SERVICE_FILE="$UNITS/dpkg-caddy-cloudflare-hook-retry.service"; TIMER_FILE="$UNITS/$TIMER_CALL"; ERR=""; CALLS=""
+check "timer file name matches the name in the hook" '[ -f "$TIMER_FILE" ] && grep -q "^TIMER=\"$TIMER_CALL\"" "$HOOK"'
+check "service is a oneshot" 'grep -qx "Type=oneshot" "$SERVICE_FILE"'
+check "service runs the hook with --retry" 'grep -qx "ExecStart=/usr/local/sbin/dpkg-caddy-cloudflare-hook --retry" "$SERVICE_FILE"'
+check "timer fires 5 minutes after start and after each run" 'grep -qx "OnActiveSec=5min" "$TIMER_FILE" && grep -qx "OnUnitActiveSec=5min" "$TIMER_FILE"'
+check "timer can be enabled" 'grep -qx "WantedBy=timers.target" "$TIMER_FILE"'
+check "install.sh parses" 'bash -n "$HERE/../install.sh"'
 
 echo "40 unknown option"
 setup; run_hook --frobnicate

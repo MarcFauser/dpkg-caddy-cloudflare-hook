@@ -24,8 +24,9 @@ jobs:
     name: real caddy package on ${{ matrix.image }}
     runs-on: ubuntu-latest
     container: ${{ matrix.image }}
-    # Worst case: 10 min for the manual add-package, 2 x 5 min inside the hook, installs.
-    # Without a limit an unanswering build server keeps a job for six hours.
+    # Worst case: 10 min for the manual add-package, about 2 min per dpkg run of the hook
+    # (three attempts of 30 s), 5 min for a retry, installs. Without a limit an unanswering
+    # build server keeps a job for six hours.
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -34,3 +35,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: bash tests/e2e.sh
+
+  e2e-systemd:
+    # Directly on the runner VM: systemd runs there, so Caddy really runs, and the hook's
+    # restart and the retry timer are real. The VM is thrown away after the job.
+    name: real caddy package with systemd (runner VM)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo bash tests/e2e.sh

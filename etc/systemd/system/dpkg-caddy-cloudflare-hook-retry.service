@@ -1,0 +1,13 @@
+# Part of dpkg-caddy-cloudflare-hook: one retry of adding the Cloudflare DNS module to
+# Caddy after a fallback. Started by dpkg-caddy-cloudflare-hook-retry.timer, which the hook
+# enables only while a fallback is active. A oneshot service has no start timeout; the
+# script limits caddy add-package itself (RETRY_TIMEOUT, 300 s).
+[Unit]
+Description=Retry adding the Cloudflare DNS module to Caddy (dpkg-caddy-cloudflare-hook)
+Documentation=https://github.com/MarcFauser/dpkg-caddy-cloudflare-hook
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/dpkg-caddy-cloudflare-hook --retry

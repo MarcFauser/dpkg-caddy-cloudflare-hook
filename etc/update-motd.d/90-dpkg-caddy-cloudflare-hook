@@ -1,0 +1,16 @@
+#!/bin/sh
+# Part of dpkg-caddy-cloudflare-hook: a notice at login while Caddy runs its previous
+# binary because the Cloudflare DNS module could not be added. Prints nothing otherwise.
+# pam_motd runs the scripts in /etc/update-motd.d at every login (see pam_motd(8)).
+state="${HOOK_STATE_DIR:-/var/lib/dpkg-caddy-cloudflare-hook}"
+
+[ -f "$state/pending" ] || exit 0
+
+printf '\n*** dpkg-caddy-cloudflare-hook: %s\n' "$(cat "$state/pending")"
+if [ -f "$state/caddy.stock" ]
+then
+    printf '*** Retried every 5 minutes. Details: journalctl -t dpkg-caddy-cloudflare-hook\n\n'
+else
+    printf '*** No automatic retry possible; run: apt install --reinstall caddy\n\n'
+fi
+exit 0

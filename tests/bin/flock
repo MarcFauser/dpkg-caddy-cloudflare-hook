@@ -1,0 +1,9 @@
+#!/bin/bash
+# Test double for flock (Git for Windows has none). "flock -n FD" fails while
+# $STATE/lockbusy exists, as if a dpkg run held the lock; "flock -w SECONDS FD" succeeds.
+echo "flock $*" >> "$STATE/calls"
+if [ "$1" = "-n" ] && [ -f "$STATE/lockbusy" ]
+then
+    exit 1
+fi
+exit 0

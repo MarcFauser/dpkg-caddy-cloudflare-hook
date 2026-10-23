@@ -102,3 +102,34 @@ Other hooks were compared before deciding:
   during the download.
 
 So the fallback with the two dpkg hooks stays.
+
+## 2026-10-23 - shorter attempts, a retry timer and a login notice
+
+The weak point of 1.1 was not the 300-second limit but the retry: it only happened at a
+later dpkg run, and on a quiet server that can be days away. Measured in CI, `add-package`
+takes 0.7 to 1.7 seconds when the build server works, so a dpkg run now makes three
+attempts of 30 seconds and then falls back right away; apt is held for about two minutes at
+most.
+Twenty short attempts inside the dpkg run were considered and rejected, because they would
+hold apt for ten minutes during an outage, and the fallback makes waiting there pointless.
+
+The retries moved out of dpkg into a systemd timer, every 5 minutes, enabled by the fallback
+and disabled by the first retry that works. A cron.d entry was the first idea; the timer
+won because systemd is always there where Caddy runs as a service (cron is a separate
+package, and a cron.d file without cron does nothing, silently), because a timer does not
+start a run that is still going (cron would need its own lock against the 300-second
+attempts), and because the unit files can be installed once and only switched on and off,
+instead of being written and deleted at runtime. The retries outside dpkg keep the long
+limit, in case a first build after a new Caddy release takes longer than 30 seconds; that
+case has not been measured.
+
+The login notice comes from `/etc/update-motd.d`, which `pam_motd` runs at every login. The
+script is installed once and prints the marker only while it exists, so nothing has to be
+created or removed when the state changes. An sshd `Banner` was not used: it is shown to
+anyone before authentication and would need a change to the SSH configuration.
+
+The question whether Caddy treats the lost plugins as a bug has an answer:
+caddyserver/dist#106 (open since 2023) asks for exactly this, and the maintainers reply that
+Caddy's own package management and the OS's do not mix; their documented way is
+`dpkg-divert` with `update-alternatives`, which takes the binary in use out of apt's hands.
+This hook keeps apt in charge instead.

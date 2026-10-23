@@ -1,8 +1,20 @@
 #!/bin/bash
-# Test double for systemctl.
+# Test double for systemctl. The caddy service state comes from files under $STATE; the
+# retry timer is "enabled" while $STATE/timer-enabled exists.
 S="$STATE"
 echo "systemctl $*" >> "$S/calls"
 case "$1" in
+    enable)
+        if [ -f "$S/timerfail" ]
+        then
+            echo "System has not been booted with systemd as init system (PID 1). Can't operate." >&2
+            exit 1
+        fi
+        touch "$S/timer-enabled"
+        ;;
+    disable)
+        rm -f "$S/timer-enabled"
+        ;;
     is-enabled) [ -f "$S/enabled" ] ;;
     is-active)  [ -f "$S/active" ] ;;
     is-failed)  [ -f "$S/failed" ] ;;

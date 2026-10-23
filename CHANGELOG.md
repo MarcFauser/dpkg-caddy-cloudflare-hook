@@ -4,6 +4,31 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-10-23
+
+### Added
+
+- Retry timer: `dpkg-caddy-cloudflare-hook-retry.timer` and `.service`, installed disabled.
+  A fallback enables the timer; every 5 minutes it runs the script with the new option
+  `--retry`, which adds the module to the kept stock binary (one attempt of up to 300 s,
+  `RETRY_TIMEOUT`), puts the result in place, restarts Caddy and disables the timer again.
+- Login notice: `/etc/update-motd.d/90-dpkg-caddy-cloudflare-hook` shows the fallback
+  marker at login (for example over SSH) until a retry has worked.
+- A lock (`flock` on `/var/lib/dpkg-caddy-cloudflare-hook/lock`) keeps timer runs and dpkg
+  runs apart; a timer run gives way to a running dpkg hook.
+- End-to-end test on the GitHub runner VM with systemd: the running Caddy process, the
+  hook's restart after `dpkg -i`, the timer and the login notice are checked for real.
+
+### Changed
+
+- During a dpkg run the hook makes up to three attempts of 30 s each, 5 s apart
+  (`ADD_PACKAGE_ATTEMPTS`, `ADD_PACKAGE_TIMEOUT`, `ATTEMPT_PAUSE`), instead of one of 300 s.
+- dpkg runs no longer retry during a fallback; they report it and make sure the timer is on.
+  The hourly retry at dpkg runs (`RETRY_INTERVAL`) is gone.
+- When the kept stock binary is missing, the retries stop but the marker and the login
+  notice stay, pointing to `apt install --reinstall caddy`.
+- `install.sh` installs and removes the units and the login notice.
+
 ## [1.1.1] - 2026-10-23
 
 ### Changed
