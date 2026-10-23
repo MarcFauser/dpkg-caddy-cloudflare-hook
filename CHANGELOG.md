@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.2] - 2026-10-23
+
+### Fixed
+
+- `caddy add-package` could hold the whole dpkg run indefinitely: Caddy downloads with a
+  plain `http.Get` without a timeout, and its build server comes without an SLA (the first
+  CI run waited six hours). The call is now limited to 300 seconds (`ADD_PACKAGE_TIMEOUT`).
+  If it is killed after caddy moved the old binary to `<binary>.tmp`, the hook puts it back.
+- The CI jobs have time limits, and the end-to-end test limits its own `add-package` call,
+  so an unreachable build server fails the run within minutes instead of hours.
+
 ## [1.0.1] - 2026-10-23
 
 ### Added

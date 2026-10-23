@@ -23,6 +23,18 @@ case "$1" in
             echo "Error: package is already added" >&2
             exit 1
         fi
+        if [ -f "$S/hang" ]
+        then
+            # the build server does not answer; exec so that timeout hits this very process
+            exec sleep 30
+        fi
+        if [ -f "$S/hangafterrename" ]
+        then
+            # what caddy does before writing the new binary, then the download stalls
+            mv -f "$0" "$0.tmp"
+            printf '#!/bin/bash\nexit 99\n' > "$0"
+            exec sleep 30
+        fi
         if [ -f "$S/netfail" ]
         then
             echo "Error: download failed: dial tcp: lookup caddyserver.com: no such host" >&2

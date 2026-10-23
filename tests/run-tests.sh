@@ -26,7 +26,7 @@ setup()
 
 run_hook()
 {
-    ERR="$(CADDY_BIN="$BIN/caddy" PATH="$BIN:$PATH" bash "$HOOK" 2>&1 >/dev/null)"
+    ERR="$(CADDY_BIN="${TEST_CADDY_BIN:-$BIN/caddy}" ADD_PACKAGE_TIMEOUT="${TEST_TIMEOUT:-300}" PATH="$BIN:$PATH" bash "$HOOK" 2>&1 >/dev/null)"
     RC=$?
     CALLS="$(cat "$STATE/calls")"
 }
@@ -135,6 +135,29 @@ check "--version names the tool" 'case "$VER_OUT" in "dpkg-caddy-cloudflare-hook
 check "script version equals newest CHANGELOG version" '[ -n "$VER" ] && [ "$VER" = "$CHG" ]'
 check "hook script parses" 'bash -n "$HOOK"'
 check "install.sh parses" 'bash -n "$HERE/../install.sh"'
+echo "18 add-package hangs (build server not answering)"
+setup enabled hang; TEST_TIMEOUT=2; started=$SECONDS; run_hook; took=$((SECONDS - started)); unset TEST_TIMEOUT
+check "exit 0" '[ "$RC" -eq 0 ]'
+check "reports the time limit" 'grep -q "did not finish within 2 s" <<< "$ERR"'
+check "returns within the limit (took ${took}s)" '[ "$took" -lt 20 ]'
+check "no restart" '! grep -q "systemctl restart" <<< "$CALLS"'
+
+echo "19 killed after caddy parked its binary as .tmp"
+setup enabled hangafterrename; mkdir "$STATE/bin"; cp "$BIN/caddy" "$STATE/bin/caddy"
+TEST_CADDY_BIN="$STATE/bin/caddy"; TEST_TIMEOUT=2; run_hook; unset TEST_CADDY_BIN TEST_TIMEOUT
+check "reports the time limit" 'grep -q "did not finish within 2 s" <<< "$ERR"'
+check "reports the restore" 'grep -q "put the previous binary back" <<< "$ERR"'
+check "previous binary is back" 'cmp -s "$BIN/caddy" "$STATE/bin/caddy"'
+check "no .tmp left" '[ ! -e "$STATE/bin/caddy.tmp" ]'
+
+echo "20 a .tmp that was there before is not ours"
+setup enabled netfail; mkdir "$STATE/bin"; cp "$BIN/caddy" "$STATE/bin/caddy"; echo stale > "$STATE/bin/caddy.tmp"
+TEST_CADDY_BIN="$STATE/bin/caddy"; run_hook; unset TEST_CADDY_BIN
+check "reports the failure" 'grep -q "caddy add-package failed" <<< "$ERR"'
+check "does not restore" '! grep -q "put the previous binary back" <<< "$ERR"'
+check "old .tmp untouched" '[ "$(cat "$STATE/bin/caddy.tmp")" = stale ]'
+check "binary untouched" 'cmp -s "$BIN/caddy" "$STATE/bin/caddy"'
+
 echo "10 control: the old check misses a present module"
 setup module=dns.providers.cloudflare
 ERR=""; CALLS=""

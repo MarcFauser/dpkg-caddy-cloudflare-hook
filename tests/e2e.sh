@@ -46,7 +46,19 @@ then
 fi
 
 step "add the module by hand, as on a real server"
-caddy add-package github.com/caddy-dns/cloudflare > "$LOG_DIR/add-package.log" 2>&1 || { cat "$LOG_DIR/add-package.log"; fail "manual caddy add-package failed"; }
+# caddy downloads without a timeout from a build server without an SLA; the first CI run
+# waited six hours here, so the call is limited.
+rc=0
+timeout --kill-after=10 600 caddy add-package github.com/caddy-dns/cloudflare > "$LOG_DIR/add-package.log" 2>&1 || rc=$?
+if [ "$rc" -ne 0 ]
+then
+    cat "$LOG_DIR/add-package.log"
+    if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]
+    then
+        fail "caddy add-package did not finish within 600 s: the build server at caddyserver.com is not answering"
+    fi
+    fail "manual caddy add-package failed (exit $rc)"
+fi
 has_module || fail "module missing after the manual add-package"
 
 step "install the hook"

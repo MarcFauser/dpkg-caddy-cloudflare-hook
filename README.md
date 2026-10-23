@@ -85,7 +85,16 @@ the download from `caddyserver.com` takes.
   Caddy release with the module, which may be newer than the packaged version. dpkg's
   checksum for `/usr/bin/caddy` no longer matches after that, so `dpkg --verify caddy`
   reports it.
-- `caddy add-package` is marked experimental by Caddy.
+- **It depends on Caddy's build server.** `caddy add-package` downloads from
+  `caddyserver.com/api/download` with a plain `http.Get` and no timeout, and the build server
+  comes without an SLA. The hook therefore stops the call after 300 seconds
+  (`ADD_PACKAGE_TIMEOUT`); if caddy had already moved the old binary to `<binary>.tmp`, the
+  hook puts it back. Caddy then has no module until the next dpkg run or a manual
+  `caddy add-package`. On 2026-10-23 the build server did not answer for hours.
+- `caddy add-package` is marked experimental, and a Caddy maintainer has proposed moving it
+  out of the core binary into a plugin
+  ([caddyserver/caddy#7010](https://github.com/caddyserver/caddy/issues/7010), open). If
+  that happens, this hook needs a different way to get the module.
 
 ## Tests
 
@@ -103,7 +112,8 @@ reinstalls caddy, so not for a server that matters). It installs Caddy from Cadd
 repository, adds the module by hand, installs the hook, and checks that an `apt` reinstall
 gets the module back in the unpack run, that `dpkg -i` gets it back too, that an unrelated
 dpkg run stays silent, and that `--uninstall` removes both files. Containers have no systemd,
-so the service restart itself is not covered.
+so the service restart itself is not covered. It needs Caddy's build server, so it fails
+(within minutes, with a message saying so) while that server is not answering.
 
 GitHub Actions (`.github/workflows/tests.yml`) runs the unit tests and the end-to-end test in
 Debian 12, Debian 13 and Ubuntu 24.04 on every push, weekly and on demand. Not yet run on a

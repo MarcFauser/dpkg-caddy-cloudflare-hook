@@ -29,15 +29,21 @@
 #   from caddyserver.com and replaces the binary it runs from. The downloaded version can
 #   be newer than the one apt installed, and dpkg's checksum for /usr/bin/caddy no longer
 #   matches; both are accepted.
+# - The download is a plain http.Get without any timeout, and Caddy's build server comes
+#   without an SLA (caddyserver/caddy#7010). It hung for six hours in CI on 2026-10-23, so
+#   the call is limited here; otherwise it would hold the whole dpkg run. Before writing
+#   the new binary, caddy renames the old one to "<binary>.tmp" and restores it only when
+#   it exits normally - not when it is killed, so the hook puts it back itself.
 
 set -u
 
-VERSION="1.0.1"
+VERSION="1.0.2"
 TAG="dpkg-caddy-cloudflare-hook"
 PLUGIN_PACKAGE="github.com/caddy-dns/cloudflare"
 MODULE_ID="dns.providers.cloudflare"
 SERVICE="caddy"
 CADDY_BIN="${CADDY_BIN:-/usr/bin/caddy}"
+ADD_PACKAGE_TIMEOUT="${ADD_PACKAGE_TIMEOUT:-300}"
 
 if [ "${1:-}" = "--version" ]
 then
@@ -104,9 +110,38 @@ fi
 
 say "$VERSION: module $MODULE_ID missing from $CADDY_BIN (package state: $status, dpkg action: ${DPKG_HOOK_ACTION:-unknown}), adding $PLUGIN_PACKAGE"
 
-if ! output="$("$CADDY_BIN" add-package "$PLUGIN_PACKAGE" 2>&1)"
+# Where caddy parks the old binary while writing the new one. Only a backup that appears
+# during this call is ours to restore; one that was already there is left alone.
+backup="$CADDY_BIN.tmp"
+backup_existed=0
+if [ -e "$backup" ]
 then
-    fail "caddy add-package failed: $(printf '%s\n' "$output" | tail -n 5)"
+    backup_existed=1
+fi
+
+output="$(timeout --kill-after=10 "$ADD_PACKAGE_TIMEOUT" "$CADDY_BIN" add-package "$PLUGIN_PACKAGE" 2>&1)"
+rc=$?
+
+if [ "$rc" -ne 0 ]
+then
+    if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]
+    then
+        reason="caddy add-package did not finish within $ADD_PACKAGE_TIMEOUT s (is caddyserver.com answering?)"
+    else
+        reason="caddy add-package failed: $(printf '%s\n' "$output" | tail -n 5)"
+    fi
+
+    if [ "$backup_existed" -eq 0 ] && [ -e "$backup" ]
+    then
+        if mv -f -- "$backup" "$CADDY_BIN"
+        then
+            reason="$reason; put the previous binary back from $backup"
+        else
+            reason="$reason; could not move $backup back to $CADDY_BIN, do it by hand"
+        fi
+    fi
+
+    fail "$reason"
 fi
 
 if ! has_module

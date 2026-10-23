@@ -15,6 +15,7 @@ jobs:
   unit:
     name: unit tests (test doubles)
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
       - run: bash tests/run-tests.sh
@@ -23,6 +24,9 @@ jobs:
     name: real caddy package on ${{ matrix.image }}
     runs-on: ubuntu-latest
     container: ${{ matrix.image }}
+    # Worst case: 10 min for the manual add-package, 2 x 5 min inside the hook, installs.
+    # Without a limit an unanswering build server keeps a job for six hours.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
