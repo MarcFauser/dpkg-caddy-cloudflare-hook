@@ -1,13 +1,26 @@
 #!/bin/bash
-# Test double for dpkg-query -W -f='${Status}' caddy. Status comes from $STATE/status.
+# Test double for dpkg-query -W -f='${Status}' caddy (status from $STATE/status) and
+# -f='${Version}' caddy (version from $STATE/pkgversion).
 if [ -f "$STATE/notinstalled" ]
 then
     echo "dpkg-query: no packages found matching caddy" >&2
     exit 1
 fi
-if [ -f "$STATE/status" ]
-then
-    printf '%s' "$(cat "$STATE/status")"
-else
-    printf 'install ok installed'
-fi
+case "$2" in
+    *Version*)
+        if [ -f "$STATE/pkgversion" ]
+        then
+            printf '%s' "$(cat "$STATE/pkgversion")"
+        else
+            printf '2.11.7'
+        fi
+        ;;
+    *)
+        if [ -f "$STATE/status" ]
+        then
+            printf '%s' "$(cat "$STATE/status")"
+        else
+            printf 'install ok installed'
+        fi
+        ;;
+esac

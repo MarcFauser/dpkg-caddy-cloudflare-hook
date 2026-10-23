@@ -46,3 +46,32 @@ Two properties are deliberate. The script never exits non-zero, because a failin
 hook aborts dpkg and could leave an upgrade half done; failures are reported instead. And
 both installed files carry the same name, `dpkg-caddy-cloudflare-hook`, so that one search
 finds both and the name in `/usr/local/sbin` says what the script belongs to.
+
+## 2026-10-23 - the build server, and falling back to the previous binary
+
+The first GitHub Actions run hung for six hours in the end-to-end test, at the manual
+`caddy add-package`. Caddy downloads its custom builds with a plain `http.Get` without a
+timeout, and the build server at caddyserver.com did not answer for hours that night while
+Caddy's apt repository on Cloudsmith worked fine - the two are separate services, so a
+working `apt update` says nothing about the build server. On a server the hook would have
+held the whole dpkg run, so 1.0.2 limited the call to 300 seconds.
+
+That left Caddy with the stock binary and without the module, which means it does not start
+with a configuration that uses Cloudflare. The question that led to 1.1.0 was whether it
+would not be better to keep the old binary. It is, but by the time the post-invoke hook
+runs, dpkg has already replaced it. dpkg also runs pre-invoke hooks before each action, so
+the hook now saves the binary with the module there and puts it back when adding the module
+fails.
+
+The fallback raised the next question: does apt offer the update again? It does not. The
+package upgrade itself succeeded, so dpkg records the new version as installed; only the
+binary on disk is older. The hook therefore keeps the stock binary and the marker `pending`,
+and retries by itself. It adds the module to the stock binary again rather than running
+`caddy upgrade` on the old one, because `upgrade` pins every plugin to the version it
+already has. Retries run at most once an hour from dpkg, so that an unanswering build server
+does not hold every dpkg run for five minutes, and at once when the hook is run by hand.
+
+While at it, `add-package` moved to a copy in the state directory. Caddy replaces the file
+it runs from, so running it on `/usr/bin/caddy` meant a half-written or missing binary
+there if it was killed; now `/usr/bin/caddy` is replaced with one rename after the module is
+confirmed.

@@ -1,7 +1,9 @@
 # Put the Cloudflare DNS module back into Caddy right after dpkg unpacked a new caddy
-# binary, before the package's postinst restarts the service.
+# binary, before the package's postinst restarts the service. Before the run, save the
+# binary that has the module, so that it can be put back if adding the module fails.
 # Installed as /etc/dpkg/dpkg.cfg.d/dpkg-caddy-cloudflare-hook (dpkg reads only file
 # names made of letters, digits, "-" and "_"); the script is
 # /usr/local/sbin/dpkg-caddy-cloudflare-hook. A failing invoke hook aborts dpkg, so a
 # crash of the script is reported but never returned to dpkg.
-post-invoke=if [ -x /usr/local/sbin/dpkg-caddy-cloudflare-hook ]; then /usr/local/sbin/dpkg-caddy-cloudflare-hook || echo 'dpkg-caddy-cloudflare-hook: unexpected failure, see journalctl -t dpkg-caddy-cloudflare-hook' >&2; fi
+pre-invoke=if [ -x /usr/local/sbin/dpkg-caddy-cloudflare-hook ]; then /usr/local/sbin/dpkg-caddy-cloudflare-hook --pre-invoke || echo 'dpkg-caddy-cloudflare-hook: unexpected failure, see journalctl -t dpkg-caddy-cloudflare-hook' >&2; fi
+post-invoke=if [ -x /usr/local/sbin/dpkg-caddy-cloudflare-hook ]; then /usr/local/sbin/dpkg-caddy-cloudflare-hook --post-invoke || echo 'dpkg-caddy-cloudflare-hook: unexpected failure, see journalctl -t dpkg-caddy-cloudflare-hook' >&2; fi

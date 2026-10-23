@@ -1,24 +1,40 @@
 #!/bin/bash
-# Test double for caddy. State lives in files under $STATE.
+# Test double for caddy. Shared state lives in files under $STATE. What a particular
+# binary contains is written into its own file as marker lines at the end ("module" and
+# "version", see marker() below), so a copy of it keeps it, like a real binary.
 S="$STATE"
+
+marker()
+{
+    sed -n "s/^# fake-$1: //p" "$0" | tail -n 1
+}
+
+module="$(marker module)"
+if [ -z "$module" ] && [ -f "$S/module" ]
+then
+    module="$(cat "$S/module")"
+fi
+version="$(marker version)"
+version="${version:-v2.11.7}"
+
 case "$1" in
     list-modules)
         echo "http.handlers.file_server"
-        if [ -f "$S/module" ]
+        if [ -n "$module" ]
         then
             if [ "${2:-}" = "--packages" ]
             then
                 echo "dns.providers.cloudflare github.com/caddy-dns/cloudflare"
             else
-                cat "$S/module"
+                echo "$module"
             fi
         fi
         echo ""
         echo "  Standard modules: 1"
         ;;
     add-package)
-        echo "add-package $2" >> "$S/calls"
-        if [ -f "$S/module" ]
+        echo "add-package $2 on $0" >> "$S/calls"
+        if [ -n "$module" ]
         then
             echo "Error: package is already added" >&2
             exit 1
@@ -30,7 +46,7 @@ case "$1" in
         fi
         if [ -f "$S/hangafterrename" ]
         then
-            # what caddy does before writing the new binary, then the download stalls
+            # what caddy does once the build arrived, then the download stalls
             mv -f "$0" "$0.tmp"
             printf '#!/bin/bash\nexit 99\n' > "$0"
             exec sleep 30
@@ -44,10 +60,20 @@ case "$1" in
         then
             exit 0
         fi
-        echo "dns.providers.cloudflare" > "$S/module"
+        # like caddy: park the old binary, write the new one in its place, drop the old one
+        new_version="$(cat "$S/newversion" 2>/dev/null || echo v2.11.8)"
+        content="$(sed '/^# fake-/d' "$0")"
+        mv -f "$0" "$0.tmp"
+        {
+            printf '%s\n' "$content"
+            echo "# fake-module: dns.providers.cloudflare"
+            echo "# fake-version: $new_version"
+        } > "$0"
+        chmod 755 "$0"
+        rm -f "$0.tmp"
         echo "Module versions: (long list)"
         ;;
     version)
-        echo "v2.11.7 h1:test"
+        echo "$version h1:test"
         ;;
 esac

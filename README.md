@@ -4,7 +4,8 @@
 
 A dpkg hook for Debian and Ubuntu that puts the Cloudflare DNS module back into
 [Caddy](https://caddyserver.com) whenever the `caddy` package is upgraded, **before Caddy is
-started again**.
+started again**. If the module cannot be added, it puts the previous binary back, so Caddy
+keeps running, and tries again later.
 
 ## The problem
 
@@ -23,7 +24,34 @@ starts.
 
 After every dpkg run it checks whether `caddy list-modules` still lists
 `dns.providers.cloudflare`. If not, it runs `caddy add-package github.com/caddy-dns/cloudflare`
-and checks again. It stays silent when there is nothing to do.
+on a copy of the binary, checks the result and puts it in place of `/usr/bin/caddy` with one
+rename. It stays silent when there is nothing to do.
+
+Before every dpkg run that unpacks or installs packages, it saves `/usr/bin/caddy` if that
+binary has the module. That copy is the fallback described below.
+
+## When the module cannot be added
+
+`caddy add-package` needs Caddy's build server at `caddyserver.com`. That is a different
+service from Caddy's apt repository (hosted on Cloudsmith), so the package upgrade can work
+while the build server does not answer; on 2026-10-23 it did not answer for hours.
+
+When adding the module fails, or takes longer than 300 seconds, the hook:
+
+1. keeps the package's stock binary as `/var/lib/dpkg-caddy-cloudflare-hook/caddy.stock`,
+2. puts the saved binary with the module back into `/usr/bin/caddy`, so Caddy keeps running
+   in its previous version,
+3. writes the marker `/var/lib/dpkg-caddy-cloudflare-hook/pending` and reports an error.
+
+**apt does not offer the update again.** The package upgrade itself succeeded, so dpkg
+records the new version as installed; only the binary on disk is the older one. The hook
+therefore retries by itself: while the marker exists, it adds the module to the kept stock
+binary again on a later dpkg run, at most once per 60 minutes so that an unanswering build
+server does not hold every dpkg run. Run by hand (`sudo dpkg-caddy-cloudflare-hook`), it
+retries at once. If you replace `/usr/bin/caddy` yourself in the meantime, the retries stop.
+
+If `/usr/bin/caddy` did not have the module before the dpkg run, nothing was saved and there
+is nothing to fall back to: Caddy is left with the stock binary and the error is reported.
 
 ## Why it runs before the restart
 
@@ -61,7 +89,12 @@ This installs two files and runs the hook once:
 | `/usr/local/sbin/dpkg-caddy-cloudflare-hook` | 755 |
 | `/etc/dpkg/dpkg.cfg.d/dpkg-caddy-cloudflare-hook` | 644 |
 
-Update: `git pull` and run `sudo ./install.sh` again. Remove: `sudo ./install.sh --uninstall`.
+The hook keeps its state in `/var/lib/dpkg-caddy-cloudflare-hook`: the saved binary, during
+a fallback the stock binary and the marker, and briefly a work copy while `add-package`
+runs. That is a few times the size of the caddy binary.
+
+Update: `git pull` and run `sudo ./install.sh` again. Remove: `sudo ./install.sh --uninstall`
+(also removes the state directory).
 
 ## Checking that it worked
 
@@ -69,11 +102,12 @@ Update: `git pull` and run `sudo ./install.sh` again. Remove: `sudo ./install.sh
 journalctl -t dpkg-caddy-cloudflare-hook
 grep -n dpkg-caddy-cloudflare-hook /var/log/apt/term.log
 caddy list-modules | grep -Fx dns.providers.cloudflare
+cat /var/lib/dpkg-caddy-cloudflare-hook/pending   # exists only while a fallback is active
 ```
 
 An end-to-end test is `sudo apt install --reinstall caddy`: it puts the stock binary back,
-and the hook has to add the module before the restart. Caddy is unavailable for as long as
-the download from `caddyserver.com` takes.
+and the hook has to add the module before the restart. The old Caddy process keeps running
+during the download, and the restart comes from the package's `postinst` afterwards.
 
 ## Behaviour worth knowing
 
@@ -88,9 +122,9 @@ the download from `caddyserver.com` takes.
 - **It depends on Caddy's build server.** `caddy add-package` downloads from
   `caddyserver.com/api/download` with a plain `http.Get` and no timeout, and the build server
   comes without an SLA. The hook therefore stops the call after 300 seconds
-  (`ADD_PACKAGE_TIMEOUT`); if caddy had already moved the old binary to `<binary>.tmp`, the
-  hook puts it back. Caddy then has no module until the next dpkg run or a manual
-  `caddy add-package`. On 2026-10-23 the build server did not answer for hours.
+  (`ADD_PACKAGE_TIMEOUT`) and falls back as described above.
+- **During a fallback, Caddy is older than the package.** `dpkg -s caddy` shows the new
+  version, `caddy version` the old one, until a retry succeeds.
 - `caddy add-package` is marked experimental, and a Caddy maintainer has proposed moving it
   out of the core binary into a plugin
   ([caddyserver/caddy#7010](https://github.com/caddyserver/caddy/issues/7010), open). If
@@ -104,16 +138,20 @@ bash tests/run-tests.sh
 
 The unit tests run the unchanged hook against small test doubles for `caddy`, `systemctl`,
 `dpkg-query` and `logger`, covering the unpack and the `dpkg -i` paths, the package states,
-download and restart failures and the line in `dpkg.cfg.d` itself. They need only bash and
-the usual text tools, so they also run under Git for Windows.
+download and restart failures, a hanging download, saving the binary before the dpkg run,
+the fallback, the retry and its interval, and the lines in `dpkg.cfg.d` themselves. They
+need only bash and the usual text tools, so they also run under Git for Windows.
 
 `tests/e2e.sh` is the end-to-end test for a throwaway Debian or Ubuntu container (it
-reinstalls caddy, so not for a server that matters). It installs Caddy from Caddy's apt
-repository, adds the module by hand, installs the hook, and checks that an `apt` reinstall
-gets the module back in the unpack run, that `dpkg -i` gets it back too, that an unrelated
-dpkg run stays silent, and that `--uninstall` removes both files. Containers have no systemd,
-so the service restart itself is not covered. It needs Caddy's build server, so it fails
-(within minutes, with a message saying so) while that server is not answering.
+reinstalls caddy and edits `/etc/hosts`, so not for a server that matters). It installs
+Caddy from Caddy's apt repository, adds the module by hand, installs the hook, and checks
+that an `apt` reinstall gets the module back in the unpack run, that `dpkg -i` gets it back
+too, that with `caddyserver.com` blocked a reinstall falls back to the previous binary while
+dpkg counts the package as installed, that running the hook by hand afterwards adds the
+module, that an unrelated dpkg run stays silent, and that `--uninstall` removes everything.
+Containers have no systemd, so the service restart itself is not covered. It needs Caddy's
+build server, so it fails (within minutes, with a message saying so) while that server is
+not answering.
 
 GitHub Actions (`.github/workflows/tests.yml`) runs the unit tests and the end-to-end test in
 Debian 12, Debian 13 and Ubuntu 24.04 on every push, weekly and on demand. Not yet run on a

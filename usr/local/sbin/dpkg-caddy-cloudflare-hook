@@ -2,10 +2,14 @@
 # dpkg-caddy-cloudflare-hook
 #
 # Puts the Cloudflare DNS module back into Caddy after the caddy package replaced
-# /usr/bin/caddy with the stock binary - before Caddy is started again.
+# /usr/bin/caddy with the stock binary - before Caddy is started again. When the module
+# cannot be added, it puts the previous binary (with the module) back so that Caddy keeps
+# running, and tries again later.
 #
 # Installed as /usr/local/sbin/dpkg-caddy-cloudflare-hook (mode 755) and called from
-# /etc/dpkg/dpkg.cfg.d/dpkg-caddy-cloudflare-hook after every dpkg run (post-invoke).
+# /etc/dpkg/dpkg.cfg.d/dpkg-caddy-cloudflare-hook before (--pre-invoke) and after
+# (--post-invoke, also the default without an option) every dpkg run. Its state lives in
+# /var/lib/dpkg-caddy-cloudflare-hook.
 #
 # Timing: apt runs "dpkg --unpack" and "dpkg --configure" as separate dpkg runs
 # (apt-pkg/deb/dpkgpm.cc: "Do all actions with the same Op in one run"), and Caddy's
@@ -15,41 +19,69 @@
 # leaves the restart to the postinst. With a direct "dpkg -i" both steps are one run, the
 # package is already configured when the hook runs, and the hook restarts Caddy itself.
 #
+# The fallback: dpkg runs pre-invoke hooks before the action and post-invoke hooks after
+# it (src/main/main.c, run_invoke_hooks around cipaction->action). Before a run that
+# unpacks or installs, the pre-invoke step saves /usr/bin/caddy as caddy.previous if it
+# has the module. When the post-invoke step cannot add the module, it keeps the stock
+# binary as caddy.stock, puts caddy.previous back and writes the marker "pending". dpkg
+# still counts the new package version as installed, so apt will not offer it again; the
+# hook retries by itself on a later dpkg run (at most once per RETRY_INTERVAL minutes, any
+# time when run by hand) by adding the module to caddy.stock.
+#
 # It never exits non-zero: dpkg aborts when an invoke hook fails (run_invoke_hooks).
 # Problems are reported on stderr (visible in the apt output and /var/log/apt/term.log)
-# and in the journal (journalctl -t dpkg-caddy-cloudflare-hook); the next dpkg run tries
-# again.
+# and in the journal (journalctl -t dpkg-caddy-cloudflare-hook).
 #
-# Behaviour of the caddy commands, read in the Caddy source (v2.11.7):
+# Behaviour of the caddy commands, read in the Caddy source (v2.11.7, cmd/packagesfuncs.go):
 # - "caddy list-modules" prints one module ID per line. With "--packages" a line is
 #   "<id> <package>", so an exact match on the package path never hits; the module ID
 #   is compared instead.
 # - "caddy add-package" fails with "package is already added" when the plugin is there.
-#   Otherwise it downloads the latest Caddy with all current plugins plus the new one
-#   from caddyserver.com and replaces the binary it runs from. The downloaded version can
+#   Otherwise it asks caddyserver.com for a build of the latest Caddy with all current
+#   plugins plus the new one and replaces the binary it runs from (os.Executable). The
+#   hook therefore runs it on a copy in its work directory and puts the result into place
+#   with one rename, after checking that the module is there. The downloaded version can
 #   be newer than the one apt installed, and dpkg's checksum for /usr/bin/caddy no longer
 #   matches; both are accepted.
-# - The download is a plain http.Get without any timeout, and Caddy's build server comes
-#   without an SLA (caddyserver/caddy#7010). It hung for six hours in CI on 2026-10-23, so
-#   the call is limited here; otherwise it would hold the whole dpkg run. Before writing
-#   the new binary, caddy renames the old one to "<binary>.tmp" and restores it only when
-#   it exits normally - not when it is killed, so the hook puts it back itself.
+# - "caddy upgrade" would pin every plugin to the version it has (path@version), so the
+#   retry adds the module to the stock binary again instead.
+# - The download is a plain http.Get without any timeout (line 298), and Caddy's build
+#   server comes without an SLA (caddyserver/caddy#7010). It did not answer for hours on
+#   2026-10-23, so the call is limited here; otherwise it would hold the whole dpkg run.
 
 set -u
 
-VERSION="1.0.2"
+VERSION="1.1.0"
 TAG="dpkg-caddy-cloudflare-hook"
 PLUGIN_PACKAGE="github.com/caddy-dns/cloudflare"
 MODULE_ID="dns.providers.cloudflare"
 SERVICE="caddy"
 CADDY_BIN="${CADDY_BIN:-/usr/bin/caddy}"
+STATE_DIR="${HOOK_STATE_DIR:-/var/lib/dpkg-caddy-cloudflare-hook}"
 ADD_PACKAGE_TIMEOUT="${ADD_PACKAGE_TIMEOUT:-300}"
+RETRY_INTERVAL="${RETRY_INTERVAL:-60}"
 
-if [ "${1:-}" = "--version" ]
-then
-    printf '%s %s\n' "$TAG" "$VERSION"
-    exit 0
-fi
+PREVIOUS="$STATE_DIR/caddy.previous"   # last binary with the module, saved before dpkg replaced it
+STOCK="$STATE_DIR/caddy.stock"         # the package's binary while the previous one runs instead
+PENDING="$STATE_DIR/pending"           # present while the previous binary runs instead
+WORK="$STATE_DIR/work"                 # caddy add-package runs here, on a copy
+
+case "${1:-}" in
+    --version)
+        printf '%s %s\n' "$TAG" "$VERSION"
+        exit 0
+        ;;
+    --pre-invoke)
+        mode="pre"
+        ;;
+    --post-invoke | "")
+        mode="post"
+        ;;
+    *)
+        printf '%s: unknown option %s (expected --pre-invoke, --post-invoke or --version)\n' "$TAG" "$1" >&2
+        exit 2
+        ;;
+esac
 
 say()
 {
@@ -57,17 +89,107 @@ say()
     logger -t "$TAG" -p user.notice -- "$*" 2>/dev/null || true
 }
 
-fail()
+note()
+{
+    logger -t "$TAG" -p user.notice -- "$*" 2>/dev/null || true
+}
+
+warn()
 {
     printf '%s: ERROR: %s\n' "$TAG" "$*" >&2
     logger -t "$TAG" -p user.err -- "ERROR: $*" 2>/dev/null || true
+}
+
+fail()
+{
+    warn "$@"
     exit 0
 }
 
 has_module()
 {
-    "$CADDY_BIN" list-modules 2>/dev/null \
+    "${1:-$CADDY_BIN}" list-modules 2>/dev/null \
         | awk -v id="$MODULE_ID" '$1 == id { found = 1 } END { exit !found }'
+}
+
+binary_version()
+{
+    "$1" version 2>/dev/null | awk 'NR == 1 { print $1 }'
+}
+
+# Copies $1 to $2 through a sibling file and a rename, so $2 is never half written.
+place_copy()
+{
+    local src="$1" dst="$2"
+    local new="$dst.$TAG-new"
+
+    if cp --preserve=mode,ownership -- "$src" "$new" \
+        && { sync -- "$new" 2>/dev/null || sync; } \
+        && mv -f -- "$new" "$dst"
+    then
+        return 0
+    fi
+
+    rm -f -- "$new"
+    return 1
+}
+
+write_pending()
+{
+    local new="$PENDING.$TAG-new"
+
+    if printf '%s\n' "$1" > "$new" \
+        && { sync -- "$new" 2>/dev/null || sync; } \
+        && mv -f -- "$new" "$PENDING"
+    then
+        return 0
+    fi
+
+    rm -f -- "$new"
+    warn "could not write $PENDING, so there will be no automatic retry; run $TAG by hand later"
+    return 1
+}
+
+clear_pending()
+{
+    rm -f -- "$PENDING" "$STOCK"
+}
+
+# Runs caddy add-package on a copy of $1. On success the result is $WORK/caddy and has the
+# module; otherwise $reason says why. The caller removes $WORK.
+build_with_module()
+{
+    local src="$1" output rc
+
+    rm -rf -- "$WORK"
+    if ! mkdir -p -- "$WORK" || ! cp --preserve=mode,ownership -- "$src" "$WORK/caddy"
+    then
+        reason="could not copy $src to $WORK"
+        return 1
+    fi
+
+    output="$(timeout --kill-after=10 "$ADD_PACKAGE_TIMEOUT" "$WORK/caddy" add-package "$PLUGIN_PACKAGE" 2>&1)"
+    rc=$?
+
+    if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]
+    then
+        reason="caddy add-package did not finish within $ADD_PACKAGE_TIMEOUT s (is caddyserver.com answering?)"
+        return 1
+    fi
+
+    if [ "$rc" -ne 0 ]
+    then
+        reason="caddy add-package failed: $(printf '%s\n' "$output" | tail -n 5)"
+        return 1
+    fi
+
+    if ! has_module "$WORK/caddy"
+    then
+        reason="module $MODULE_ID still missing after caddy add-package"
+        return 1
+    fi
+
+    return 0
 }
 
 service_in_use()
@@ -75,6 +197,119 @@ service_in_use()
     systemctl is-enabled --quiet "$SERVICE" 2>/dev/null \
         || systemctl is-active --quiet "$SERVICE" 2>/dev/null \
         || systemctl is-failed --quiet "$SERVICE" 2>/dev/null
+}
+
+# Before the postinst ran, it restarts Caddy itself; afterwards the hook does it, but only
+# for a service that is in use.
+restart_after_change()
+{
+    if [ "$configured" -eq 0 ]
+    then
+        say "caddy is not configured yet, its postinst will restart the service"
+        return 0
+    fi
+
+    if ! service_in_use
+    then
+        return 0
+    fi
+
+    if ! systemctl restart "$SERVICE"
+    then
+        warn "systemctl restart $SERVICE failed, see: journalctl -u $SERVICE -n 50"
+        return 1
+    fi
+
+    if ! systemctl is-active --quiet "$SERVICE"
+    then
+        warn "$SERVICE is not active after the restart, see: journalctl -u $SERVICE -n 50"
+        return 1
+    fi
+
+    say "$SERVICE restarted"
+}
+
+# Puts the result of build_with_module into place and ends a pending fallback.
+install_built()
+{
+    if ! place_copy "$WORK/caddy" "$CADDY_BIN"
+    then
+        rm -rf -- "$WORK"
+        warn "could not put the new binary into $CADDY_BIN"
+        return 1
+    fi
+
+    rm -rf -- "$WORK"
+    clear_pending
+    say "module added, binary is now: $(binary_version "$CADDY_BIN")"
+    restart_after_change
+}
+
+# The module could not be added to the stock binary that dpkg just installed ($1 says why).
+fall_back()
+{
+    local why="$1" package_version previous_version
+
+    if [ ! -f "$PREVIOUS" ] || ! has_module "$PREVIOUS"
+    then
+        fail "$why; there is no saved binary with the module to fall back to"
+    fi
+
+    package_version="$(dpkg-query -W -f='${Version}' caddy 2>/dev/null)"
+
+    if ! place_copy "$CADDY_BIN" "$STOCK"
+    then
+        fail "$why; could not keep the stock binary as $STOCK, so the previous binary was not put back"
+    fi
+
+    if ! place_copy "$PREVIOUS" "$CADDY_BIN"
+    then
+        rm -f -- "$STOCK"
+        fail "$why; could not put $PREVIOUS back into $CADDY_BIN"
+    fi
+
+    previous_version="$(binary_version "$CADDY_BIN")"
+    write_pending "caddy package $package_version is installed, the previous binary $previous_version runs instead"
+    warn "$why; put the previous binary ($previous_version, with the module) back, so caddy $package_version from the package does not run yet. dpkg counts $package_version as installed and apt will not offer it again; this hook tries again at a dpkg run in $RETRY_INTERVAL minutes or later, or run $TAG by hand"
+    restart_after_change
+}
+
+# The previous binary runs instead of the package's: try to add the module again.
+retry_pending()
+{
+    if [ ! -f "$PREVIOUS" ] || ! cmp -s -- "$CADDY_BIN" "$PREVIOUS"
+    then
+        say "$CADDY_BIN changed since the fallback (replaced by hand?), no more retries"
+        clear_pending
+        return 0
+    fi
+
+    if [ ! -f "$STOCK" ]
+    then
+        warn "the stock binary $STOCK is gone, so there is nothing to retry with; run: apt install --reinstall caddy"
+        clear_pending
+        return 0
+    fi
+
+    # Run by dpkg, at most once per RETRY_INTERVAL minutes: a build server that does not
+    # answer would otherwise hold every dpkg run for ADD_PACKAGE_TIMEOUT. By hand, always.
+    if [ -n "${DPKG_HOOK_ACTION:-}" ] && [ -n "$(find "$PENDING" -mmin "-$RETRY_INTERVAL" 2>/dev/null)" ]
+    then
+        say "still waiting: $(cat -- "$PENDING" 2>/dev/null); next try at a dpkg run $RETRY_INTERVAL minutes after the last one, or run $TAG by hand"
+        return 0
+    fi
+
+    say "$VERSION: $(cat -- "$PENDING" 2>/dev/null); adding $PLUGIN_PACKAGE to the stock binary again"
+
+    if ! build_with_module "$STOCK"
+    then
+        rm -rf -- "$WORK"
+        touch -- "$PENDING"
+        warn "$reason; the previous binary keeps running"
+        return 0
+    fi
+
+    install_built
 }
 
 # Package state decides who restarts Caddy: "unpacked" or "half-configured" means its
@@ -102,74 +337,65 @@ then
     exit 0
 fi
 
+if [ "$mode" = "pre" ]
+then
+    # Only before a run that can replace the binary, and never during a fallback: then
+    # the binary is caddy.previous already, or someone replaced it by hand.
+    case "${DPKG_HOOK_ACTION:-}" in
+        unpack | install) ;;
+        *) exit 0 ;;
+    esac
+
+    if [ -f "$PENDING" ]
+    then
+        exit 0
+    fi
+
+    if [ -f "$PREVIOUS" ] && cmp -s -- "$CADDY_BIN" "$PREVIOUS"
+    then
+        exit 0
+    fi
+
+    # The stock binary is no fallback.
+    if ! has_module
+    then
+        exit 0
+    fi
+
+    if mkdir -p -- "$STATE_DIR" && place_copy "$CADDY_BIN" "$PREVIOUS"
+    then
+        note "saved $CADDY_BIN ($(binary_version "$CADDY_BIN")) as $PREVIOUS"
+    else
+        warn "could not save $CADDY_BIN as $PREVIOUS, so there will be nothing to fall back to"
+    fi
+
+    exit 0
+fi
+
 # The common case after every dpkg run: the module is there, stay silent.
 if has_module
 then
+    if [ -f "$PENDING" ]
+    then
+        retry_pending
+    fi
+
     exit 0
 fi
 
 say "$VERSION: module $MODULE_ID missing from $CADDY_BIN (package state: $status, dpkg action: ${DPKG_HOOK_ACTION:-unknown}), adding $PLUGIN_PACKAGE"
 
-# Where caddy parks the old binary while writing the new one. Only a backup that appears
-# during this call is ours to restore; one that was already there is left alone.
-backup="$CADDY_BIN.tmp"
-backup_existed=0
-if [ -e "$backup" ]
+if ! mkdir -p -- "$STATE_DIR"
 then
-    backup_existed=1
+    fail "could not create $STATE_DIR"
 fi
 
-output="$(timeout --kill-after=10 "$ADD_PACKAGE_TIMEOUT" "$CADDY_BIN" add-package "$PLUGIN_PACKAGE" 2>&1)"
-rc=$?
-
-if [ "$rc" -ne 0 ]
+if build_with_module "$CADDY_BIN"
 then
-    if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]
-    then
-        reason="caddy add-package did not finish within $ADD_PACKAGE_TIMEOUT s (is caddyserver.com answering?)"
-    else
-        reason="caddy add-package failed: $(printf '%s\n' "$output" | tail -n 5)"
-    fi
-
-    if [ "$backup_existed" -eq 0 ] && [ -e "$backup" ]
-    then
-        if mv -f -- "$backup" "$CADDY_BIN"
-        then
-            reason="$reason; put the previous binary back from $backup"
-        else
-            reason="$reason; could not move $backup back to $CADDY_BIN, do it by hand"
-        fi
-    fi
-
-    fail "$reason"
-fi
-
-if ! has_module
-then
-    fail "module $MODULE_ID still missing after caddy add-package"
-fi
-
-say "module added, binary is now: $("$CADDY_BIN" version 2>/dev/null | head -n 1)"
-
-if [ "$configured" -eq 0 ]
-then
-    say "caddy is not configured yet, its postinst will restart the service"
+    install_built
     exit 0
 fi
 
-if service_in_use
-then
-    if ! systemctl restart "$SERVICE"
-    then
-        fail "systemctl restart $SERVICE failed, see: journalctl -u $SERVICE -n 50"
-    fi
-
-    if ! systemctl is-active --quiet "$SERVICE"
-    then
-        fail "$SERVICE is not active after the restart, see: journalctl -u $SERVICE -n 50"
-    fi
-
-    say "$SERVICE restarted"
-fi
-
+rm -rf -- "$WORK"
+fall_back "$reason"
 exit 0

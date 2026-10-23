@@ -9,6 +9,7 @@ SCRIPT_SRC="$HERE/usr/local/sbin/$NAME"
 CONF_SRC="$HERE/etc/dpkg/dpkg.cfg.d/$NAME"
 SCRIPT_DST="/usr/local/sbin/$NAME"
 CONF_DST="/etc/dpkg/dpkg.cfg.d/$NAME"
+STATE_DIR="/var/lib/$NAME"
 
 if [ "$(id -u)" -ne 0 ]
 then
@@ -24,8 +25,13 @@ fi
 
 if [ "${1:-}" = "--uninstall" ]
 then
+    if [ -f "$STATE_DIR/pending" ]
+    then
+        echo "$NAME: note: a fallback was active ($(cat -- "$STATE_DIR/pending")); /usr/bin/caddy stays as it is" >&2
+    fi
     rm -f -- "$CONF_DST" "$SCRIPT_DST"
-    echo "$NAME: removed $CONF_DST and $SCRIPT_DST"
+    rm -rf -- "$STATE_DIR"
+    echo "$NAME: removed $CONF_DST, $SCRIPT_DST and $STATE_DIR"
     exit 0
 fi
 

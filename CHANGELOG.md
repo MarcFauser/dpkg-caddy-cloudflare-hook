@@ -4,6 +4,32 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-10-23
+
+### Added
+
+- Fallback to the previous binary: a new `pre-invoke` line saves `/usr/bin/caddy` as
+  `/var/lib/dpkg-caddy-cloudflare-hook/caddy.previous` before a dpkg run that unpacks or
+  installs packages, if it has the module. When the module cannot be added after the
+  package replaced the binary, the hook puts that copy back, so Caddy keeps running with
+  the module instead of failing to start. The package's own binary is kept as
+  `caddy.stock`, and the marker `pending` says which version waits.
+- Retry: dpkg counts the new package version as installed, so apt does not offer it
+  again. While the marker exists, the hook adds the module to `caddy.stock` again on a
+  later dpkg run, at most once per 60 minutes (`RETRY_INTERVAL`), or at once when run by
+  hand. A binary replaced by hand in the meantime ends the retries.
+- End-to-end test of the fallback and the retry, with `caddyserver.com` blocked in
+  `/etc/hosts`.
+
+### Changed
+
+- `caddy add-package` runs on a copy in `/var/lib/dpkg-caddy-cloudflare-hook/work`, and
+  `/usr/bin/caddy` is replaced with one rename only after the module is confirmed. The
+  `.tmp` handling next to `/usr/bin/caddy` from 1.0.2 is no longer needed.
+- `install.sh --uninstall` also removes `/var/lib/dpkg-caddy-cloudflare-hook`.
+- The script takes `--pre-invoke` or `--post-invoke`; without an option it works as
+  before (post-invoke).
+
 ## [1.0.2] - 2026-10-23
 
 ### Fixed
