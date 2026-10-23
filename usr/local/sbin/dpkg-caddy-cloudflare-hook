@@ -51,7 +51,7 @@
 
 set -u
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 TAG="dpkg-caddy-cloudflare-hook"
 PLUGIN_PACKAGE="github.com/caddy-dns/cloudflare"
 MODULE_ID="dns.providers.cloudflare"

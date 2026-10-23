@@ -75,3 +75,30 @@ While at it, `add-package` moved to a copy in the state directory. Caddy replace
 it runs from, so running it on `/usr/bin/caddy` meant a half-written or missing binary
 there if it was killed; now `/usr/bin/caddy` is replaced with one rename after the module is
 confirmed.
+
+## 2026-10-23 - why there is no "fail and roll back", and no strict mode
+
+The obvious alternative to the fallback was to let the hook fail, so that the installation is
+marked as broken and rolled back. dpkg does not work that way. It restores old files only while
+it is still unpacking; once a package is "Unpacked", the backups are gone (Debian Policy 6.6
+calls this a point of no return), and errors during configuration are not unwound at all. The
+post-invoke hook runs after the unpack is complete, so a failing hook only makes dpkg exit with
+an error. apt then stops (`Dpkg::StopOnError`) without the configure run, for every package in
+that run. Caddy would be left half-installed with the stock binary, and the `apt --fix-broken
+install` that apt asks for next would start it without the module.
+
+Other hooks were compared before deciding:
+
+- apt's `DPkg::Pre-Install-Pkgs` runs before dpkg touches anything and knows which packages and
+  versions are coming. It could build the new binary in advance and abort the apt run if that
+  fails - a strict mode that refuses the upgrade instead of falling back. Rejected: an abort
+  stops all other updates of that run as long as the build server is down, it does not cover
+  `dpkg -i`, and for Caddy the result is the same as the fallback (the old binary with the
+  module keeps running). The only gain would be that dpkg still lists the old version.
+- apt's `DPkg::Post-Invoke` runs after all dpkg runs, which is after Caddy's restart.
+- A dpkg file trigger on `/usr/bin/caddy` needs a package of its own, and apt passes
+  `--no-triggers` to every dpkg run but the last, so it would also run after the restart.
+- A systemd `ExecStartPre` runs only after the old process was stopped, so Caddy would be down
+  during the download.
+
+So the fallback with the two dpkg hooks stays.
