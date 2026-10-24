@@ -4,6 +4,13 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2026-10-25
+
+### Changed
+
+- The README writes all commands as root, without `sudo` (not installed on a default
+  Debian), and mentions `apt install git` for minimal installations. No change to the hook.
+
 ## [1.2.0] - 2026-10-23
 
 ### Added

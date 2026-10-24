@@ -51,7 +51,7 @@ records the new version as installed; only the binary on disk is the older one. 
 therefore retries every 5 minutes, outside of any dpkg run: it adds the module to the kept
 stock binary (one attempt of up to 300 seconds, in case a first build after a new Caddy
 release takes longer), puts the result in place, restarts Caddy and disables itself. dpkg
-runs during a fallback only report it. Run by hand (`sudo dpkg-caddy-cloudflare-hook --retry`),
+runs during a fallback only report it. Run by hand as root (`dpkg-caddy-cloudflare-hook --retry`),
 it retries at once. If you replace `/usr/bin/caddy` yourself in the meantime, the retries
 stop.
 
@@ -88,10 +88,12 @@ restarts only a service that is in use (enabled, active or failed).
 
 ## Install
 
+As root (`apt install git` first on minimal installations):
+
 ```bash
 git clone https://github.com/MarcFauser/dpkg-caddy-cloudflare-hook.git
 cd dpkg-caddy-cloudflare-hook
-sudo ./install.sh
+./install.sh
 ```
 
 This installs five files and runs the hook once:
@@ -108,10 +110,12 @@ The hook keeps its state in `/var/lib/dpkg-caddy-cloudflare-hook`: the saved bin
 a fallback the stock binary and the marker, and briefly a work copy while `add-package`
 runs. That is a few times the size of the caddy binary.
 
-Update: `git pull` and run `sudo ./install.sh` again. Remove: `sudo ./install.sh --uninstall`
-(also removes the state directory).
+Update: `git pull` and run `./install.sh` again. Remove: `./install.sh --uninstall` (also
+removes the state directory). Both as root.
 
 ## Checking that it worked
+
+As root:
 
 ```bash
 journalctl -t dpkg-caddy-cloudflare-hook
@@ -121,7 +125,7 @@ cat /var/lib/dpkg-caddy-cloudflare-hook/pending   # exists only while a fallback
 systemctl list-timers --all dpkg-caddy-cloudflare-hook-retry.timer
 ```
 
-An end-to-end test is `sudo apt install --reinstall caddy`: it puts the stock binary back,
+An end-to-end test is `apt install --reinstall caddy` as root: it puts the stock binary back,
 and the hook has to add the module before the restart. The old Caddy process keeps running
 during the download, and the restart comes from the package's `postinst` afterwards.
 
