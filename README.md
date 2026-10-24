@@ -1,5 +1,11 @@
 # dpkg-caddy-cloudflare-hook
 
+> **Superseded by [caddy-deb](https://github.com/MarcFauser/caddy-deb)**, an apt repository
+> with Caddy and the Cloudflare DNS module built in, so apt manages the binary that runs and
+> no hook is needed. This repository is archived. To remove the hook, run
+> `./install.sh --uninstall` in its folder as root, then follow caddy-deb's README,
+> section "On a server".
+
 [![tests](https://github.com/MarcFauser/dpkg-caddy-cloudflare-hook/actions/workflows/tests.yml/badge.svg)](https://github.com/MarcFauser/dpkg-caddy-cloudflare-hook/actions/workflows/tests.yml)
 
 A dpkg hook for Debian and Ubuntu that puts the Cloudflare DNS module back into

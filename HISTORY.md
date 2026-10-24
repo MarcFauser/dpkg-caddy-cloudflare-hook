@@ -133,3 +133,13 @@ caddyserver/dist#106 (open since 2023) asks for exactly this, and the maintainer
 Caddy's own package management and the OS's do not mix; their documented way is
 `dpkg-divert` with `update-alternatives`, which takes the binary in use out of apt's hands.
 This hook keeps apt in charge instead.
+
+## 2026-10-25 - superseded by caddy-deb
+
+The hook worked and was well tested, but it remained a workaround: it wrote into a file that
+belongs to dpkg, behind dpkg's back, and depended on `caddy add-package`, which Caddy marks
+as experimental, and on Caddy's build server. The clean way is to package Caddy with the
+plugin built in, the way Caddy packages itself, so that apt manages exactly the binary that
+runs. That is [caddy-deb](https://github.com/MarcFauser/caddy-deb), an apt repository built
+and signed in GitHub Actions; its HISTORY.md has the reasoning. The servers were moved to it
+on 2026-10-25, and this repository was archived.
